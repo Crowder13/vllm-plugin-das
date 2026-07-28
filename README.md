@@ -1,5 +1,5 @@
 <h3 align="center">
-vLLM HCU Plugin (`vllm-plugin-das`)
+vLLM HCU Plugin
 </h3>
 
 ---
@@ -153,40 +153,5 @@ enter `vllm_hcu/`. Internal runtime markers use the version-neutral
 `_vllm_hcu_*` prefix. Restart all Python/vLLM processes after installing a new
 wheel so stale module identities and custom-op registrations cannot survive an
 upgrade.
-
-## Tests
-
-Install the lightweight test dependency and run the automated patch suites:
-
-```bash
-python -m pip install -r requirements-test.txt
-python tools/run_patch_tests.py --suite inventory
-python tools/run_patch_tests.py --suite accuracy
-python tools/run_patch_tests.py --suite contract
-python tools/run_patch_tests.py --suite full
-```
-
-The runner locates `/workspace/vllm_0251` automatically. Use
-`--vllm-source /path/to/vllm_0251` or set `VLLM_V0251_SOURCE_ROOT` for another
-checkout. `inventory` validates registration and patch contracts, `contract`
-runs the portable CPU/mocked behavior suites, and `full` also runs tests marked
-`hcu`, which require a live HCU/ROCm runtime and the compiled extensions. Extra
-pytest arguments can be appended after `--`.
-
-`accuracy` runs portable operator/reference comparisons with explicit
-tolerances. On an HCU runner, use `--suite accuracy-hcu` for real lightop and
-Triton-kernel comparisons.
-
-`tools/check_patch_test_coverage.py` is a pytest-independent preflight. It
-fails when a new `patch_*.py` module lacks the standard adapter contract or a
-direct test reference:
-
-```bash
-python tools/check_patch_test_coverage.py --json
-```
-
-See `docs/patch_test_coverage_v0251.md` for the complete 638-test inventory,
-the 82-patch grouping, hardware boundaries, and the recommended model smoke
-matrix.
 
 ---
