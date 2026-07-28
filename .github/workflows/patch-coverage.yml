@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: Patch coverage
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  static-patch-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Verify every patch has a contract and test reference
+        run: python tools/check_patch_test_coverage.py
+      - name: Compile test and patch tooling
+        run: python -m compileall -q tools tests
