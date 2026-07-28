@@ -1,0 +1,16 @@
+# Integration layer
+
+This layer contains tests that create a real vLLM engine, `LLM`, model,
+connector, or server.
+
+Subdirectories:
+
+- `models/`: checkpoint loading, generation, token, and logprob comparisons.
+- `graph/`: real CUDA Graph capture/replay versus eager execution.
+- `lora/`: base, LoRA-only, LoRA+Graph, and LoRA+Spec Decode.
+- `spec_decode/`: MTP/Eagle/rejection and batch-state correctness.
+- `kv_transfer/`: connector lifecycle and local producer/consumer integration.
+- `server/`: OpenAI-compatible server startup, EvalScope requests, and shutdown.
+
+The default integration target is one local HCU. Tests needing more resources
+must use the corresponding pytest markers.
