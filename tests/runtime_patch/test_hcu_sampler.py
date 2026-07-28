@@ -117,3 +117,44 @@ def test_hcu_topk_topp_forward_is_feature_gated_and_lazy(monkeypatch):
     token_ids, _ = sampler(logits, {0: torch.Generator()}, k, None)
     assert token_ids.tolist() == [7]
     assert len(native_calls) == 2
+
+
+def test_hcu_topk_topp_custom_path_receives_softmax_probs_and_filters(
+    monkeypatch,
+):
+    sampler = HcuTopKTopPSampler()
+    calls = []
+
+    def custom_sampling(probs, top_k, top_p, deterministic):
+        calls.append((probs, top_k, top_p, deterministic))
+        return torch.tensor([[2], [0]], dtype=torch.int64)
+
+    lightop = ModuleType("lightop")
+    lightop.sampling = SimpleNamespace(
+        top_k_top_p_sampling_from_probs=custom_sampling,
+    )
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setattr(topk_topp_sample.henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(
+        topk_topp_sample.henvs,
+        "VLLM_HCU_USE_CUSTOM_TOPK_TOPP_SAMPLER",
+        True,
+    )
+    logits = torch.tensor(
+        [[0.0, 1.0, 2.0], [4.0, 0.0, -4.0]],
+        dtype=torch.float32,
+    )
+    top_k = torch.tensor([2, 1], dtype=torch.int32)
+    top_p = torch.tensor([0.8, 1.0], dtype=torch.float32)
+
+    token_ids, logprobs = sampler(logits, {}, top_k, top_p)
+
+    assert token_ids.tolist() == [2, 0]
+    assert logprobs is None
+    assert len(calls) == 1
+    probs, observed_top_k, observed_top_p, deterministic = calls[0]
+    torch.testing.assert_close(probs, logits.softmax(dim=-1, dtype=torch.float32))
+    assert probs.is_contiguous()
+    assert observed_top_k is top_k
+    assert observed_top_p is top_p
+    assert deterministic is True

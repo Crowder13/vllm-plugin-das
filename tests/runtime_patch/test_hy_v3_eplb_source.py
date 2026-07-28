@@ -7,7 +7,7 @@ import ast
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_hy_v3_decoder_layer_passes_enable_eplb_to_moe() -> None:

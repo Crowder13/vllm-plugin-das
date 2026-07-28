@@ -5,8 +5,11 @@ import ast
 from pathlib import Path
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 def test_hcu_platform_uses_gpu_punica_wrapper() -> None:
-    source = Path("vllm_hcu/platforms/hcu.py").read_text(encoding="utf-8")
+    source = (ROOT / "vllm_hcu/platforms/hcu.py").read_text(encoding="utf-8")
     module = ast.parse(source)
 
     hcu_platform = next(

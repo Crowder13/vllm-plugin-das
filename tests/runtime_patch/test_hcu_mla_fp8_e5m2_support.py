@@ -5,7 +5,7 @@ import ast
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _get_supported_kv_cache_dtypes(relative_path: str) -> list[str]:
