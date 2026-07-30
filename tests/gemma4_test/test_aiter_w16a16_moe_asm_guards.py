@@ -46,6 +46,6 @@ def test_unquantized_moe_asm_shuffle_has_front_loaded_blockers() -> None:
 
     assert "_raise_if_aiter_moe_asm_blocked(self, layer)" in source
     assert source.index("_raise_if_aiter_moe_asm_blocked(self, layer)") < source.index(
-        "asm_shuffle_weight_b8"
+        "aiter_moe_shfl_weight"
     )
     compile(source, "unquantized_fused_moe_method.py", "exec")

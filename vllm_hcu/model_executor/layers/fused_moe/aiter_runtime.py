@@ -24,8 +24,28 @@ class HcuAiterRuntimeError(RuntimeError):
     """An explicitly requested HCU AITER path cannot be provided."""
 
 
+def aiter_gate_mode_kwargs(
+    gate_mode: str,
+    *,
+    supports_gate_mode: bool,
+) -> dict[str, str]:
+    """Return the AITER ABI argument or reject an unsupported layout."""
+
+    if not gate_mode:
+        return {}
+    if not supports_gate_mode:
+        raise HcuAiterRuntimeError(
+            "HCU AITER fused_moe ABI does not support "
+            f"non-default gate_mode={gate_mode!r}"
+        )
+    return {"gate_mode": gate_mode}
+
+
 _EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
     "vllm_hcu_explicit_aiter_moe", default=False
+)
+_AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
+    "vllm_hcu_aiter_moe_global_num_experts", default=None
 )
 
 
@@ -58,13 +78,18 @@ def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
 
 @contextmanager
 def aiter_moe_request_context(moe_config: object):
-    token = _EXPLICIT_AITER_MOE.set(
+    request_token = _EXPLICIT_AITER_MOE.set(
         getattr(moe_config, "moe_backend", None) == "aiter"
     )
+    global_num_experts = getattr(moe_config, "num_experts", None)
+    if not isinstance(global_num_experts, int) or global_num_experts <= 0:
+        global_num_experts = None
+    experts_token = _AITER_MOE_GLOBAL_NUM_EXPERTS.set(global_num_experts)
     try:
         yield
     finally:
-        _EXPLICIT_AITER_MOE.reset(token)
+        _AITER_MOE_GLOBAL_NUM_EXPERTS.reset(experts_token)
+        _EXPLICIT_AITER_MOE.reset(request_token)
 
 
 def _import_optional_aiter_module(module_name: str) -> object | None:
@@ -140,6 +165,71 @@ def is_triton_fp8_bmm_enabled(
         aiter_enabled
         and feature_enabled
         and has_triton_fp8_bmm()
+    )
+
+
+def triton_rope_and_cache_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    layer_slot_mapping: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    flash_layout: bool,
+    apply_scale: bool,
+) -> None:
+    """Compose the RoPE and cache APIs exposed by HCU AITER."""
+
+    from aiter.ops.cache import reshape_and_cache, reshape_and_cache_flash
+    from aiter.ops.triton.rope import (
+        rope_cached_thd_positions_2c_fwd_inplace,
+    )
+
+    num_tokens = positions.numel()
+    cos, sin = cos_sin_cache.chunk(2, dim=-1)
+    head_size = cos.shape[-1]
+    query_view = query.view(num_tokens, -1, head_size)
+    key_view = key.view(num_tokens, -1, head_size)
+    rope_cached_thd_positions_2c_fwd_inplace(
+        query_view,
+        key_view,
+        cos,
+        sin,
+        positions.view(num_tokens),
+        0 if is_neox else 1,
+        reuse_freqs_front_part=True,
+        nope_first=False,
+    )
+
+    kv_cache_dtype = "fp8" if apply_scale else "auto"
+    if flash_layout:
+        reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            layer_slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
+        return
+
+    reshape_and_cache(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        layer_slot_mapping,
+        kv_cache_dtype,
+        float(k_scale.item()),
+        float(v_scale.item()),
+        False,
     )
 
 
@@ -353,7 +443,7 @@ def _activation_name(activation_method: int) -> str:
 
 
 @functools.cache
-def get_w16a16_moe_solution_id(
+def get_w16a16_moe_config(
     M: int,
     E: int,
     N1: int,
@@ -363,7 +453,7 @@ def get_w16a16_moe_solution_id(
     dtype: torch.dtype,
     activation: str,
     use_shuffle: int,
-) -> str:
+) -> object:
     try:
         from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
     except Exception as exc:
@@ -383,16 +473,47 @@ def get_w16a16_moe_solution_id(
         dtype=dtype,
         quant_type=MoeQuantType.W16A16,
         activation=activation,
+        spec_sol_type=MoeSolutionType.ASM,
         use_shuffle=use_shuffle,
     )
-    if not status or moe_config.solution_type != MoeSolutionType.ASM:
+    if (
+        not status
+        or moe_config is None
+        or moe_config.solution_type != MoeSolutionType.ASM
+    ):
         raise HcuAiterRuntimeError(
             "AITER W16A16 MoE did not find an ASM solution for "
             f"M={M}, E={E}, N1={N1}, N2={N2}, K={K}, top_k={top_k}, "
             f"dtype={dtype}, activation={activation}, use_shuffle={use_shuffle}"
         )
+    return moe_config
 
-    config = moe_config.config or {}
+
+@functools.cache
+def get_w16a16_moe_solution_id(
+    M: int,
+    E: int,
+    N1: int,
+    N2: int,
+    K: int,
+    top_k: int,
+    dtype: torch.dtype,
+    activation: str,
+    use_shuffle: int,
+) -> str:
+    moe_config = get_w16a16_moe_config(
+        M,
+        E,
+        N1,
+        N2,
+        K,
+        top_k,
+        dtype,
+        activation,
+        use_shuffle,
+    )
+
+    config = getattr(moe_config, "config", None) or {}
     try:
         return f"{config['SOL_ID1']}+{config['SOL_ID2']}"
     except KeyError as exc:
@@ -400,6 +521,66 @@ def get_w16a16_moe_solution_id(
             "AITER W16A16 ASM configuration is missing SOL_ID1/SOL_ID2: "
             f"{config}"
         ) from exc
+
+
+def _aiter_asm_expert_mask_contract(
+    expert_mask: torch.Tensor | None,
+    local_num_experts: int,
+) -> tuple[int, torch.Tensor | None]:
+    """Validate vLLM's AITER EP mask before it reaches the ASM sorter.
+
+    vLLM uses two different EP tensors at the MoE layer boundary:
+
+    * a global-to-local map of shape ``[global_num_experts]`` containing local
+      expert ids and ``-1``;
+    * an AITER mask of shape
+      ``[global_num_experts + fused_shared_experts + 1]`` whose final element
+      is a sentinel.
+
+    The proprietary ASM sorter accepts only the latter.  Passing the former
+    can make global expert ids index local weights and cause a device VMFault,
+    so reject the ambiguous layout before launching a kernel.
+    """
+
+    global_num_experts = _AITER_MOE_GLOBAL_NUM_EXPERTS.get()
+    if expert_mask is None:
+        if (
+            global_num_experts is not None
+            and global_num_experts != local_num_experts
+        ):
+            raise HcuAiterRuntimeError(
+                "AITER W16A16 ASM MoE requires an expert mask for EP: "
+                f"global_num_experts={global_num_experts}, "
+                f"local_num_experts={local_num_experts}"
+            )
+        return global_num_experts or local_num_experts, None
+
+    if expert_mask.dim() != 1 or expert_mask.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise HcuAiterRuntimeError(
+            "unexpected AITER expert mask layout: "
+            f"shape={tuple(expert_mask.shape)}, dtype={expert_mask.dtype}"
+        )
+    if global_num_experts is None:
+        raise HcuAiterRuntimeError(
+            "AITER W16A16 ASM MoE received an EP tensor without the global "
+            "expert count from FusedMoEConfig"
+        )
+
+    # AITER's mask contains all routed experts followed by any fused shared
+    # experts and a final sentinel.  A plain vLLM global-to-local map has
+    # exactly global_num_experts entries and must not reach the ASM sorter.
+    if expert_mask.numel() < global_num_experts + 1:
+        raise HcuAiterRuntimeError(
+            "AITER W16A16 ASM MoE expected a 0/1 expert mask with a trailing "
+            "sentinel, but received a global-to-local expert map or truncated "
+            f"mask: shape={tuple(expert_mask.shape)}, "
+            f"global_num_experts={global_num_experts}, "
+            f"local_num_experts={local_num_experts}"
+        )
+    return global_num_experts, expert_mask
 
 
 def fused_moe_impl(
@@ -474,10 +655,9 @@ def fused_moe_impl(
                 "HCU AITER GELU-tanh MoE was selected, but "
                 "aiter.fused_moe.fused_moe is unavailable"
             ) from exc
-        parameters = inspect.signature(fused_moe).parameters
-        optional_arguments = {
+        unsupported_arguments = {
             "num_local_tokens": (num_local_tokens, None),
-            "dtype": (output_dtype, None),
+            "output_dtype": (output_dtype, None),
             "hidden_pad": (hidden_pad, 0),
             "intermediate_pad": (intermediate_pad, 0),
             "gate_mode": (gate_mode, ""),
@@ -486,13 +666,10 @@ def fused_moe_impl(
             "moe_sorting_dispatch_policy": (moe_sorting_dispatch_policy, 0),
             "swiglu_limit": (swiglu_limit, 0.0),
         }
-        supported_arguments: dict[str, object] = {}
-        for name, (value, default) in optional_arguments.items():
-            if name in parameters:
-                supported_arguments[name] = value
-            elif value != default:
+        for name, (value, default) in unsupported_arguments.items():
+            if value != default:
                 raise HcuAiterRuntimeError(
-                    "the installed proprietary AITER fused_moe ABI does not "
+                    "HCU AITER fused_moe ABI does not "
                     f"support non-default {name}={value!r}"
                 )
         return fused_moe(
@@ -509,48 +686,60 @@ def fused_moe_impl(
             w2_scale,
             a1_scale,
             a2_scale,
-            **supported_arguments,
         )
-
-    try:
-        from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
-    except Exception as exc:
-        raise HcuAiterRuntimeError(
-            "VLLM_ROCM_USE_AITER_MOE is enabled for W16A16, but "
-            "aiter.fused_moe_asm_wna16.fused_experts_asm_impl is unavailable"
-        ) from exc
 
     from vllm_hcu.platforms import envs as henvs
 
     activation = _activation_name(activation_method)
     use_shuffle = int(bool(henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE))
-    global_num_experts = (
-        int(expert_mask.numel()) if expert_mask is not None else int(w1.shape[0])
+    global_num_experts, expert_mask = _aiter_asm_expert_mask_contract(
+        expert_mask,
+        int(w1.shape[0]),
     )
-    kwargs: dict[str, Any] = {
-        "activation": activation,
-        "global_num_experts": global_num_experts,
-        "expert_map": expert_mask,
-        "use_shuffle": use_shuffle,
+    unsupported = {
+        "doweight_stage1": (doweight_stage1, False),
+        "num_local_tokens": (num_local_tokens, None),
+        "hidden_pad": (hidden_pad, 0),
+        "intermediate_pad": (intermediate_pad, 0),
+        "bias1": (bias1, None),
+        "bias2": (bias2, None),
     }
+    for name, (value, default) in unsupported.items():
+        if value != default:
+            raise HcuAiterRuntimeError(
+                "HCU AITER W16A16 MoE does not support "
+                f"non-default {name}={value!r}"
+            )
     if gate_mode:
         raise HcuAiterRuntimeError(
-            "HCU W16A16 ASM MoE cannot represent vLLM v0.25.1 "
+            "HCU AITER W16A16 MoE has no gate_mode ABI; received "
             f"gate_mode={gate_mode!r}"
         )
     if moe_sorting_dispatch_policy:
         raise HcuAiterRuntimeError(
-            "HCU W16A16 ASM MoE cannot represent vLLM v0.25.1 "
-            "moe_sorting_dispatch_policy="
+            "HCU AITER W16A16 MoE has no sorting-dispatch ABI; "
+            "received moe_sorting_dispatch_policy="
             f"{moe_sorting_dispatch_policy}"
         )
-    if swiglu_limit:
-        # The proprietary HCU ASM ABI names vLLM's SwiGLU limit gemm1_limit.
-        kwargs["gemm1_limit"] = swiglu_limit
+
+    # HCU AITER uses w1=[E, 2N, K] and w2=[E, K, N]. Its N2
+    # configuration argument is GEMM2's output dimension, i.e. w2.shape[1].
+    if (
+        w1.dim() != 3
+        or w2.dim() != 3
+        or int(w1.shape[0]) != int(w2.shape[0])
+        or int(w1.shape[1]) != 2 * int(w2.shape[2])
+        or int(w1.shape[2]) != int(w2.shape[1])
+    ):
+        raise ValueError(
+            f"unexpected MoE weight layout: w1.shape={tuple(w1.shape)}, "
+            f"w2.shape={tuple(w2.shape)}"
+        )
+
     if bool(henvs.VLLM_HCU_USE_AITER_MOE_CONFIG):
-        kwargs["solution_id"] = get_w16a16_moe_solution_id(
+        moe_config = get_w16a16_moe_config(
             M=int(hidden_states.shape[0]),
-            E=int(w1.shape[0]),
+            E=global_num_experts,
             N1=int(w1.shape[1]),
             N2=int(w2.shape[1]),
             K=int(w1.shape[2]),
@@ -559,7 +748,44 @@ def fused_moe_impl(
             activation=activation,
             use_shuffle=use_shuffle,
         )
+        try:
+            from aiter.moe import aiter_moe
+        except Exception as exc:
+            raise HcuAiterRuntimeError(
+                "HCU AITER W16A16 MoE config was selected, but "
+                "aiter.moe.aiter_moe is unavailable"
+            ) from exc
+        return aiter_moe(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weight,
+            topk_ids=topk_ids,
+            moe_config=moe_config,
+            inplace=False,
+            activation=activation,
+            global_num_experts=global_num_experts,
+            expert_map=expert_mask,
+            use_weight_shuffle=bool(use_shuffle),
+            output_dtype=output_dtype or hidden_states.dtype,
+            gemm1_limit=swiglu_limit or None,
+        )
 
+    try:
+        from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
+    except Exception as exc:
+        raise HcuAiterRuntimeError(
+            "HCU AITER direct W16A16 ASM path was selected, but "
+            "aiter.fused_moe_asm_wna16.fused_experts_asm_impl is unavailable"
+        ) from exc
+    direct_kwargs: dict[str, object] = {
+        "activation": activation,
+        "global_num_experts": global_num_experts,
+        "expert_map": expert_mask,
+        "use_shuffle": use_shuffle,
+    }
+    if swiglu_limit:
+        direct_kwargs["gemm1_limit"] = swiglu_limit
     return fused_experts_asm_impl(
         hidden_states,
         w1,
@@ -567,7 +793,7 @@ def fused_moe_impl(
         topk_weight,
         topk_ids,
         output_dtype or hidden_states.dtype,
-        **kwargs,
+        **direct_kwargs,
     )
 
 
@@ -639,12 +865,15 @@ def get_aiter_activation_type(
 
 __all__ = [
     "HcuAiterRuntimeError",
+    "aiter_gate_mode_kwargs",
     "fused_moe_impl",
     "get_aiter_activation_type",
     "get_gelu_tanh_activation_type",
+    "get_w16a16_moe_config",
     "get_w16a16_moe_solution_id",
     "is_aiter_found_and_supported",
     "rmsnorm_add_dynamic_quant_impl",
     "rmsnorm_dynamic_quant_impl",
+    "triton_rope_and_cache_impl",
     "topk_softmax_impl",
 ]

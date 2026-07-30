@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import ast
 import functools
+import inspect
+import textwrap
 import types
 from contextvars import ContextVar
 from types import ModuleType, SimpleNamespace
@@ -30,6 +33,91 @@ _MARKER = "_vllm_hcu_aiter_gelu_tanh_applied"
 _EXPLICIT_CAPABILITY_CHECK: ContextVar[bool] = ContextVar(
     "vllm_hcu_aiter_explicit_capability_check", default=False
 )
+
+
+def _build_workspace_aiter_fused_experts(
+    function,
+    globals_override: dict[str, object] | None = None,
+):
+    """Clone vLLM's expert wrapper without its official FlyDSL dependency."""
+
+    function_globals = dict(function.__globals__)
+    if globals_override:
+        function_globals.update(globals_override)
+
+    try:
+        source = textwrap.dedent(inspect.getsource(function))
+    except (OSError, TypeError):
+        # Synthetic unit-test functions have no recoverable source. Their
+        # audited bytecode contains no FlyDSL import, so only enum globals need
+        # replacing.
+        return types.FunctionType(
+            function.__code__,
+            function_globals,
+            function.__name__,
+            function.__defaults__,
+            function.__closure__,
+        )
+
+    tree = ast.parse(source)
+
+    class RemoveOfficialGateMode(ast.NodeTransformer):
+        import_count = 0
+        value_count = 0
+
+        def visit_ImportFrom(self, node: ast.ImportFrom):
+            if node.module != "aiter.ops.flydsl.moe_common":
+                return self.generic_visit(node)
+            if [alias.name for alias in node.names] != ["GateMode"]:
+                raise PatchCompatibilityError(
+                    "unexpected imports from aiter.ops.flydsl.moe_common"
+                )
+            self.import_count += 1
+            return None
+
+        def visit_Attribute(self, node: ast.Attribute):
+            node = self.generic_visit(node)
+            if (
+                node.attr == "value"
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "GateMode"
+            ):
+                values = {
+                    "INTERLEAVE": "interleave",
+                    "SEPARATED": "separated",
+                }
+                value = values.get(node.value.attr)
+                if value is None:
+                    raise PatchCompatibilityError(
+                        f"unexpected GateMode member {node.value.attr!r}"
+                    )
+                self.value_count += 1
+                return ast.copy_location(ast.Constant(value=value), node)
+            return node
+
+    transformer = RemoveOfficialGateMode()
+    tree = transformer.visit(tree)
+    if transformer.import_count not in (0, 1):
+        raise PatchCompatibilityError(
+            "unexpected number of FlyDSL GateMode imports in "
+            f"{function.__qualname__}: {transformer.import_count}"
+        )
+    if transformer.import_count == 0 and transformer.value_count:
+        raise PatchCompatibilityError(
+            f"{function.__qualname__} uses GateMode without its audited import"
+        )
+    ast.fix_missing_locations(tree)
+    namespace: dict[str, object] = {}
+    filename = inspect.getsourcefile(function) or function.__code__.co_filename
+    exec(compile(tree, filename, "exec"), function_globals, namespace)
+    rebuilt = namespace.get(function.__name__)
+    if not callable(rebuilt):
+        raise PatchCompatibilityError(
+            f"could not rebuild required HCU target {function.__qualname__}"
+        )
+    rebuilt.__kwdefaults__ = function.__kwdefaults__
+    return rebuilt
 
 
 def apply_to_module(module: ModuleType) -> bool:
@@ -78,9 +166,9 @@ def apply_to_module(module: ModuleType) -> bool:
     if gelu_tanh is None:
         raise PatchCompatibilityError("MoEActivation.GELU_TANH is missing")
 
-    # Execute the audited upstream function body with two local enum proxies
-    # only for GELU_TANH.  This retains all current kernel/quant branches and
-    # avoids process-global enum swapping under concurrent calls.
+    # Rebuild the audited upstream body without its unconditional GateMode
+    # import. HCU AITER has no FlyDSL package or gate_mode ABI.
+    normal_impl = _build_workspace_aiter_fused_experts(fused_experts)
     special_globals = dict(fused_experts.__globals__)
     special_globals["MoEActivation"] = SimpleNamespace(
         SILU=moe_activation.SILU,
@@ -92,14 +180,10 @@ def apply_to_module(module: ModuleType) -> bool:
         SILU=hcu_activation_method.SILU,
         GELU=hcu_activation_method.GELU_TANH,
     )
-    special_impl = types.FunctionType(
-        fused_experts.__code__,
+    special_impl = _build_workspace_aiter_fused_experts(
+        fused_experts,
         special_globals,
-        fused_experts.__name__,
-        fused_experts.__defaults__,
-        fused_experts.__closure__,
     )
-    special_impl.__kwdefaults__ = fused_experts.__kwdefaults__
 
     @functools.wraps(fused_experts)
     def hcu_fused_experts(*args, **kwargs):
@@ -116,10 +200,12 @@ def apply_to_module(module: ModuleType) -> bool:
         with aiter_moe_request_context(moe_config):
             if activation == gelu_tanh:
                 return special_impl(*args, **kwargs)
-            return fused_experts(*args, **kwargs)
+            return normal_impl(*args, **kwargs)
 
     @functools.wraps(supports)
     def hcu_supports_activation(activation):
+        if activation == moe_activation.SWIGLUOAI_UNINTERLEAVE:
+            return False
         return activation == gelu_tanh or supports(activation)
 
     @functools.wraps(supports_device)
@@ -138,9 +224,16 @@ def apply_to_module(module: ModuleType) -> bool:
             getattr(moe_config, "moe_backend", None) == "aiter"
         )
         try:
-            return is_supported_config(
+            supported, reason = is_supported_config(
                 cls, moe_config, weight_key, activation_key, activation_format
             )
+            mxfp4_key = getattr(target, "kMxfp4Static", None)
+            if supported and mxfp4_key is not None and weight_key == mxfp4_key:
+                return False, (
+                    "HCU AITER has no FlyDSL gate-mode/bias ABI "
+                    "required by vLLM's MXFP4 AITER expert"
+                )
+            return supported, reason
         finally:
             _EXPLICIT_CAPABILITY_CHECK.reset(token)
 

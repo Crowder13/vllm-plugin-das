@@ -149,9 +149,26 @@ def _rocm_aiter_fused_moe_impl(
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
-    extra_kwargs: dict = {}
-    if gate_mode and rocm_aiter_ops.fused_moe_supports_gate_mode():
-        extra_kwargs["gate_mode"] = gate_mode
+    _hcu_runtime.aiter_gate_mode_kwargs(
+        gate_mode,
+        supports_gate_mode=False,
+    )
+    unsupported = {
+        "num_local_tokens": (num_local_tokens, None),
+        "output_dtype": (output_dtype, None),
+        "hidden_pad": (hidden_pad, 0),
+        "intermediate_pad": (intermediate_pad, 0),
+        "bias1": (bias1, None),
+        "bias2": (bias2, None),
+        "moe_sorting_dispatch_policy": (moe_sorting_dispatch_policy, 0),
+        "swiglu_limit": (swiglu_limit, 0.0),
+    }
+    for name, (value, default) in unsupported.items():
+        if value != default:
+            raise _hcu_runtime.HcuAiterRuntimeError(
+                "HCU AITER fused_moe ABI does not support "
+                f"non-default {name}={value!r}"
+            )
 
     return fused_moe(
         hidden_states,
@@ -167,15 +184,6 @@ def _rocm_aiter_fused_moe_impl(
         w2_scale,
         a1_scale,
         a2_scale,
-        num_local_tokens=num_local_tokens,
-        dtype=output_dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        swiglu_limit=swiglu_limit,
-        **extra_kwargs,
     )
 
 
@@ -224,7 +232,7 @@ def _rocm_aiter_asm_moe_tkw1_impl(
     activation_method: int = 0,
 ) -> torch.Tensor:
     from aiter import ActivationType
-    from aiter.fused_moe_bf16_asm import asm_moe_tkw1
+    from aiter.fused_moe_asm import asm_moe_tkw1
 
     activation = ActivationType(activation_method)
 
@@ -1045,24 +1053,32 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
     variance_epsilon: float,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.quant import per_token_group_quant_fp8
+    from aiter.ops.rmsnorm import rmsnorm2d_fwd_with_add
 
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
+    normalized = torch.empty_like(x)
+    residual_out = torch.empty_like(residual)
+    rmsnorm2d_fwd_with_add(
+        normalized,
         x,
+        residual,
+        residual_out,
         weight,
         variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
-        res1=residual,
     )
-    return (
+    x_quant = torch.empty_like(normalized, dtype=FP8_DTYPE)
+    x_quant_scales = torch.empty(
+        (x.shape[0], (x.shape[1] + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    per_token_group_quant_fp8(
         x_quant,
-        res,
+        normalized,
         x_quant_scales,
+        group_size,
     )
+    return x_quant, residual_out, x_quant_scales
 
 
 def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
@@ -1087,20 +1103,23 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_impl(
     variance_epsilon: float,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+    from aiter.ops.quant import per_token_group_quant_fp8
+    from aiter.ops.rmsnorm import rmsnorm2d_fwd
 
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
-        x,
-        weight,
-        variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
-        res1=None,
+    normalized = rmsnorm2d_fwd(x, weight, variance_epsilon)
+    x_quant = torch.empty_like(normalized, dtype=FP8_DTYPE)
+    x_quant_scales = torch.empty(
+        (x.shape[0], (x.shape[1] + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
     )
-    return (x_quant, x_quant_scales)
+    per_token_group_quant_fp8(
+        x_quant,
+        normalized,
+        x_quant_scales,
+        group_size,
+    )
+    return x_quant, x_quant_scales
 
 
 def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
@@ -1229,15 +1248,29 @@ def _rocm_aiter_triton_add_rmsnorm_pad_impl(
     residual: torch.Tensor,
     x_pad_to_multiple: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+    from aiter.ops.rmsnorm import rmsnorm2d_fwd_with_add
 
-    return fused_add_rmsnorm_pad(
+    normalized = torch.empty_like(x)
+    residual_out = torch.empty_like(residual)
+    rmsnorm2d_fwd_with_add(
+        normalized,
         x,
+        residual,
+        residual_out,
         weight,
         variance_epsilon,
-        residual,
-        x_pad_to_multiple=x_pad_to_multiple,
     )
+    if x_pad_to_multiple > 0:
+        padded_width = (
+            (x.shape[-1] + x_pad_to_multiple - 1)
+            // x_pad_to_multiple
+            * x_pad_to_multiple
+        )
+        normalized = torch.nn.functional.pad(
+            normalized,
+            (0, padded_width - x.shape[-1]),
+        )
+    return normalized, residual_out
 
 
 def _rocm_aiter_triton_add_rmsnorm_pad_fake(
@@ -1331,30 +1364,23 @@ def _fused_mla_dual_rms_norm_per_token_quant_impl(
     ``(M, 1)`` scale). Only the *q* latent is FP8 quantized (it feeds the
     FP8 ``q_b_proj`` GEMM); the *kv* latent is RMS-normed and consumed by attention as bf16.
     """
-    from aiter.ops.fused_qk_rmsnorm_group_quant import (
-        fused_qk_rmsnorm_per_token_quant,
-    )
+    from aiter.ops.quant import dynamic_per_token_scaled_quant
+    from aiter.ops.rmsnorm import rmsnorm2d_fwd
 
     mq, nq = q.shape
     q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
     q_scale = torch.empty((mq, 1), dtype=torch.float32, device=q.device)
-    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
-
-    # q -> RMSNorm + FP8 per-token quant (q slot); kv -> RMSNorm only (k slot).
-    # `split` views are accepted directly (unit inner stride); the kernel
-    # handles strided inputs, matching the aiter op-test usage.
-    fused_qk_rmsnorm_per_token_quant(
-        q_out_quantized=q_out,
-        q_out_scale=q_scale,
-        q=q,
-        q_weight=q_weight,
-        q_epsilon=q_epsilon,
-        k_out=kv_normed,
-        k=kv,
-        k_weight=kv_weight,
-        k_epsilon=kv_epsilon,
-        gemma_norm=False,
+    q_normed = rmsnorm2d_fwd(q, q_weight, q_epsilon)
+    dynamic_per_token_scaled_quant(
+        q_out,
+        q_normed,
+        q_scale,
+        scale_ub=None,
+        shuffle_scale=False,
+        num_rows=None,
+        num_rows_factor=1,
     )
+    kv_normed = rmsnorm2d_fwd(kv, kv_weight, kv_epsilon)
     return q_out, q_scale, kv_normed
 
 
@@ -1416,7 +1442,8 @@ def _triton_rotary_embedding_impl(
     offsets: torch.Tensor | None = None,
 ) -> None:
     # Modifies query and key in-place
-    from aiter.ops.triton.rope.rope import (
+    from aiter.ops.triton.rope import (
+        rope_cached_thd_positions_2c_fwd_inplace,
         rope_cached_thd_positions_offsets_2c_fwd_inplace,
     )
 
@@ -1432,17 +1459,29 @@ def _triton_rotary_embedding_impl(
     query_ = query[..., :rotary_dim]
     key_ = key[..., :rotary_dim]
     positions = positions.view(*query.shape[:1])
-    rope_cached_thd_positions_offsets_2c_fwd_inplace(
-        query_,
-        key_,
-        cos,
-        sin,
-        positions,
-        offsets,
-        rotate_style,
-        reuse_freqs_front_part=True,
-        nope_first=False,
-    )
+    if offsets is None:
+        rope_cached_thd_positions_2c_fwd_inplace(
+            query_,
+            key_,
+            cos,
+            sin,
+            positions,
+            rotate_style,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
+    else:
+        rope_cached_thd_positions_offsets_2c_fwd_inplace(
+            query_,
+            key_,
+            cos,
+            sin,
+            positions,
+            offsets,
+            rotate_style,
+            reuse_freqs_front_part=True,
+            nope_first=False,
+        )
     query = query.view(query_shape)
     key = key.view(key_shape)
 
@@ -1667,7 +1706,9 @@ class rocm_aiter_ops:
     @classmethod
     @if_aiter_supported
     def is_fused_moe_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._FMOE_ENABLED
+        return (
+            cls._AITER_ENABLED and cls._FMOE_ENABLED
+        ) or _hcu_runtime.is_aiter_moe_requested()
 
     @classmethod
     @if_aiter_supported
@@ -2475,27 +2516,20 @@ class rocm_aiter_ops:
         flash_layout: bool,
         apply_scale: bool,
     ):
-        from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-
-        cos, sin = cos_sin_cache.chunk(2, dim=-1)
-        fused_qk_rope_reshape_and_cache(
+        return _hcu_runtime.triton_rope_and_cache_impl(
             query,
             key,
             value,
+            positions,
+            cos_sin_cache,
+            is_neox,
             key_cache,
             value_cache,
             layer_slot_mapping,
-            positions,
-            cos,
-            sin,
             k_scale,
             v_scale,
-            is_neox,
-            flash_layout=flash_layout,
-            apply_scale=apply_scale,
-            q_out=query,
-            k_out=key,
-            output_zeros=False,
+            flash_layout,
+            apply_scale,
         )
 
     @staticmethod

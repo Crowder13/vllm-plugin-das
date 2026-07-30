@@ -23,7 +23,7 @@ CompressedTensorsW8A8Int8MarlinMoEMethod 类实现：
     重写的方法                                  HCU 新增行为
     ───────────────────────────────────────    ──────────────────────────────────
     process_weights_after_loading(layer)       如果 AITER MoE 启用：
-                                              → 预加载 aiter 模块，设置 MoE_C 缓存属性
+                                              → 预加载 aiter 模块，设置重排权重缓存
                                               → 跳过 Marlin 权重重排
                                               否则 → Marlin interleave / kpack2 权重重排
 
@@ -35,7 +35,7 @@ CompressedTensorsW8A8Int8MarlinMoEMethod 类实现：
 
     新增的辅助方法：
       _get_aiter_moe_runtime_config()     —— 获取 AITER MoE 运行时配置（带缓存）
-      _get_aiter_weights_for_solution()   —— 按 solution_type 准备 MoE_C 重排权重
+      _get_aiter_weights_for_solution()   —— 通过 aiter.moe 公共接口准备重排权重
 
     新增的模块级辅助函数：
       _is_hcu_aiter_w8a8_moe_requested()  —— 环境变量检测
@@ -548,14 +548,10 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 )
 
             try:
-                from aiter.ops.shuffle import (  # noqa: F401
-                    moe_layout_shuffle_gemm1,
-                    moe_layout_shuffle_gemm2,
-                )
                 from aiter.moe import (  # noqa: F401
                     MoeQuantType,
-                    MoeSolutionType,
                     aiter_moe,
+                    aiter_moe_shfl_weight,
                     get_aiter_moe_config,
                 )
             except Exception as exc:
@@ -564,8 +560,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                     "are unavailable."
                 ) from exc
 
-            setattr(layer, "_hcu_aiter_moe_c_w13_weight", None)
-            setattr(layer, "_hcu_aiter_moe_c_w2_weight", None)
+            setattr(layer, "_hcu_aiter_shuffled_weights", {})
             return
         # Default Marlin weight interleave path
         #if not self.use_deepep:
@@ -634,34 +629,46 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
     def _get_aiter_weights_for_solution(
         self,
         layer: RoutedExperts,
-        solution_type: str,
+        moe_config: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return weights, optionally shuffled for MoE_C solution type."""
-        from aiter.moe import MoeSolutionType
-        from aiter.ops.shuffle import (
-            moe_layout_shuffle_gemm1,
-            moe_layout_shuffle_gemm2,
-        )
+        """Prepare weights through the public HCU AITER API."""
+        from aiter.moe import aiter_moe_shfl_weight
 
-        if solution_type != MoeSolutionType.MOE_C:
+        if not bool(getattr(moe_config, "need_shuffle", False)):
             return layer.w13_weight, layer.w2_weight
 
-        w1_moe_c = getattr(layer, "_hcu_aiter_moe_c_w13_weight", None)
-        w2_moe_c = getattr(layer, "_hcu_aiter_moe_c_w2_weight", None)
-        if w1_moe_c is not None and w2_moe_c is not None:
-            return w1_moe_c, w2_moe_c
+        cache = getattr(layer, "_hcu_aiter_shuffled_weights", None)
+        if not isinstance(cache, dict):
+            raise RuntimeError("AITER shuffled-weight cache has an invalid type.")
+        cache_key = (
+            id(layer.w13_weight),
+            getattr(layer.w13_weight, "_version", None),
+            id(layer.w2_weight),
+            getattr(layer.w2_weight, "_version", None),
+            str(getattr(moe_config, "quant_type", None)),
+            str(getattr(moe_config, "solution_type", None)),
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         with torch.no_grad():
-            w1_moe_c = moe_layout_shuffle_gemm1(layer.w13_weight).view(
-                *layer.w13_weight.shape
+            shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(
+                layer.w13_weight,
+                layer.w2_weight,
+                moe_config,
             )
-            w2_moe_c = moe_layout_shuffle_gemm2(layer.w2_weight).view(
-                *layer.w2_weight.shape
+        if (
+            not isinstance(shuffled_w1, torch.Tensor)
+            or not isinstance(shuffled_w2, torch.Tensor)
+            or shuffled_w1.shape != layer.w13_weight.shape
+            or shuffled_w2.shape != layer.w2_weight.shape
+        ):
+            raise RuntimeError(
+                "HCU AITER returned incompatible shuffled MoE weights."
             )
-
-        setattr(layer, "_hcu_aiter_moe_c_w13_weight", w1_moe_c)
-        setattr(layer, "_hcu_aiter_moe_c_w2_weight", w2_moe_c)
-        return w1_moe_c, w2_moe_c
+        cache[cache_key] = (shuffled_w1, shuffled_w2)
+        return shuffled_w1, shuffled_w2
 
     # ── apply ───────────────────────────────────────────────────────
     def apply(
@@ -698,7 +705,7 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 layer, x, topk_ids
             )
             w1, w2 = self._get_aiter_weights_for_solution(
-                layer, moe_config.solution_type
+                layer, moe_config
             )
             output = aiter_moe(
                 hidden_states=x,
@@ -722,6 +729,9 @@ class CompressedTensorsW8A8Int8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod)
                 global_num_experts=layer.global_num_experts,
                 expert_map=layer.expert_map,
                 routed_scaling_factor=1.0,
+                use_weight_shuffle=bool(
+                    getattr(moe_config, "need_shuffle", False)
+                ),
             )
             return output
 

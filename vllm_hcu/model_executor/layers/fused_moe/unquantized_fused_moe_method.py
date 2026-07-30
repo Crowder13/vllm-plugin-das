@@ -46,6 +46,20 @@ def _activation_name(layer: torch.nn.Module) -> str | None:
     return getattr(activation, "value", activation)
 
 
+def _expert_routing_tables(
+    layer: torch.nn.Module,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    routing_tables = getattr(layer, "_expert_routing_tables", None)
+    if callable(routing_tables):
+        return routing_tables()
+
+    legacy_routing_tables = getattr(layer, "_maybe_init_expert_routing_tables", None)
+    if callable(legacy_routing_tables):
+        return legacy_routing_tables()
+
+    return None
+
+
 def _raise_if_aiter_moe_asm_blocked(method: object, layer: torch.nn.Module) -> None:
     # Fail before ASM weight shuffle if the layer is not a W16A16 AITER MoE
     # layout supported by fused_experts_asm_impl.
@@ -93,9 +107,6 @@ def _raise_if_aiter_moe_asm_blocked(method: object, layer: torch.nn.Module) -> N
             "ASM MoE is blocked: " + "; ".join(blockers)
         )
 
-
-
-
 class HcuUnquantizedFusedMoEMethod(_Original):
     """HCU version of UnquantizedFusedMoEMethod.
 
@@ -120,14 +131,38 @@ class HcuUnquantizedFusedMoEMethod(_Original):
 
         try:
             if henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE:
-                from aiter.ops.shuffle import asm_shuffle_weight_b8
+                from aiter.moe import (
+                    AiterMoeConfig,
+                    MoeQuantType,
+                    MoeSolutionType,
+                    aiter_moe_shfl_weight,
+                )
+
+                shuffle_config = AiterMoeConfig(
+                    quant_type=MoeQuantType.W16A16,
+                    solution_type=MoeSolutionType.ASM,
+                    need_shuffle=True,
+                )
 
                 with torch.no_grad():
+                    shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(
+                        w1,
+                        w2,
+                        shuffle_config,
+                    )
+                    if shuffled_w1 is None or shuffled_w2 is None:
+                        raise RuntimeError(
+                            "HCU AITER returned empty W16A16 shuffled weights"
+                        )
                     replace_parameter(
-                        layer, "w13_weight", asm_shuffle_weight_b8(w1, stage=1)
+                        layer,
+                        "w13_weight",
+                        shuffled_w1,
                     )
                     replace_parameter(
-                        layer, "w2_weight", asm_shuffle_weight_b8(w2, stage=2)
+                        layer,
+                        "w2_weight",
+                        shuffled_w2,
                     )
 
                     new_w1 = layer.w13_weight
@@ -148,8 +183,7 @@ class HcuUnquantizedFusedMoEMethod(_Original):
                 moe_config=self.moe,
                 backend=self.unquantized_backend,
                 experts_cls=self.experts_cls,
-                routing_tables=layer._maybe_init_expert_routing_tables(),
-                shared_experts=layer.shared_experts,
+                routing_tables=_expert_routing_tables(layer),
             )
 
             layer._hcu_aiter_moe_asm_packed = True

@@ -147,49 +147,58 @@ def get_aiter_w8a8_runtime_config(
 
 def get_aiter_weights_for_solution(
     layer: object,
-    solution_type: object,
+    moe_config: object,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ordinary or generation-checked MOE_C shuffled weights."""
+    """Return weights prepared by the public HCU AITER API."""
 
     w1 = _required_tensor(layer, "w13_weight")
     w2 = _required_tensor(layer, "w2_weight")
-    if _enum_token(solution_type) != "MOE_C":
+    if not bool(getattr(moe_config, "need_shuffle", False)):
         return w1, w2
 
-    source_generation = (_tensor_generation(w1), _tensor_generation(w2))
-    cached = getattr(layer, "_hcu_aiter_moe_c_weights", None)
+    cache_key = (
+        _tensor_generation(w1),
+        _tensor_generation(w2),
+        _enum_token(getattr(moe_config, "quant_type", None)),
+        _enum_token(getattr(moe_config, "solution_type", None)),
+    )
+    cache = getattr(layer, "_hcu_aiter_shuffled_weights", None)
+    if cache is None:
+        cache = {}
+        setattr(layer, "_hcu_aiter_shuffled_weights", cache)
+    if not isinstance(cache, dict):
+        raise HcuCompressedTensorsMoeError(
+            "AITER shuffled-weight cache has an invalid type"
+        )
+    cached = cache.get(cache_key)
     if (
         isinstance(cached, tuple)
-        and len(cached) == 3
-        and cached[0] == source_generation
+        and len(cached) == 2
+        and isinstance(cached[0], torch.Tensor)
         and isinstance(cached[1], torch.Tensor)
-        and isinstance(cached[2], torch.Tensor)
     ):
-        return cached[1], cached[2]
+        return cached
 
     try:
-        from aiter.ops.shuffle import (
-            moe_layout_shuffle_gemm1,
-            moe_layout_shuffle_gemm2,
-        )
+        from aiter.moe import aiter_moe_shfl_weight
     except Exception as exc:
         raise HcuCompressedTensorsMoeError(
-            "AITER selected MOE_C, but its MoE shuffle operators are unavailable"
+            "HCU AITER selected a shuffled MoE layout, but "
+            "aiter.moe.aiter_moe_shfl_weight is unavailable"
         ) from exc
     with torch.no_grad():
-        shuffled_w1 = moe_layout_shuffle_gemm1(w1)
-        shuffled_w2 = moe_layout_shuffle_gemm2(w2)
-    if shuffled_w1.numel() != w1.numel() or shuffled_w2.numel() != w2.numel():
+        shuffled_w1, shuffled_w2 = aiter_moe_shfl_weight(w1, w2, moe_config)
+    if not isinstance(shuffled_w1, torch.Tensor) or not isinstance(
+        shuffled_w2, torch.Tensor
+    ):
         raise HcuCompressedTensorsMoeError(
-            "AITER MOE_C shuffle returned an incompatible weight size"
+            "HCU AITER returned missing shuffled MoE weights"
         )
-    shuffled_w1 = shuffled_w1.view_as(w1)
-    shuffled_w2 = shuffled_w2.view_as(w2)
-    setattr(
-        layer,
-        "_hcu_aiter_moe_c_weights",
-        (source_generation, shuffled_w1, shuffled_w2),
-    )
+    if shuffled_w1.shape != w1.shape or shuffled_w2.shape != w2.shape:
+        raise HcuCompressedTensorsMoeError(
+            "HCU AITER returned incompatible shuffled MoE weight shapes"
+        )
+    cache[cache_key] = (shuffled_w1, shuffled_w2)
     return shuffled_w1, shuffled_w2
 
 
@@ -238,9 +247,7 @@ def apply_aiter_w8a8_fp8_moe(
             )
 
     moe_config = get_aiter_w8a8_runtime_config(method, layer, x, topk_ids)
-    w1, w2 = get_aiter_weights_for_solution(
-        layer, getattr(moe_config, "solution_type", None)
-    )
+    w1, w2 = get_aiter_weights_for_solution(layer, moe_config)
     try:
         from aiter.moe import aiter_moe
     except Exception as exc:
@@ -275,6 +282,7 @@ def apply_aiter_w8a8_fp8_moe(
         global_num_experts=getattr(layer, "global_num_experts", -1),
         expert_map=getattr(layer, "expert_map", None),
         routed_scaling_factor=1.0,
+        use_weight_shuffle=bool(getattr(moe_config, "need_shuffle", False)),
         output_dtype=None if i_q is None else x.dtype,
     )
 
