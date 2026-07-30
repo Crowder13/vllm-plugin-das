@@ -98,8 +98,6 @@ def _resolve_vllm_root(value: Path | None) -> Path:
         else None,
         *installed_roots,
         REPOSITORY.parent / "vllm_0251",
-        Path("/workspace/vllm_0251/vllm"),
-        Path("/workspace/vllm_0251"),
     ]
     for candidate in candidates:
         if candidate is not None:

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import sysconfig
 from typing import Any
 
 import pytest
@@ -26,13 +27,17 @@ _RESULT_PREFIX = "VLLM_HCU_BOOTSTRAP_RESULT="
 
 
 def _resolve_target_vllm_root() -> Path:
+    installed_roots = tuple(
+        Path(path)
+        for key in ("platlib", "purelib")
+        if (path := sysconfig.get_path(key))
+    )
     candidates = (
         Path(os.environ["VLLM_V0251_SOURCE_ROOT"])
         if "VLLM_V0251_SOURCE_ROOT" in os.environ
         else None,
+        *installed_roots,
         REPOSITORY.parent / "vllm_0251",
-        Path("/workspace/vllm_0251/vllm"),
-        Path("/workspace/vllm_0251"),
     )
     for candidate in candidates:
         if candidate is None:

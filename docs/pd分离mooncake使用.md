@@ -36,6 +36,12 @@ mooncake whl 包（ubuntu2204）路径：http://pypi.sourcefind.cn:666/das_night
 # prefill 端和 decode 端都需要设置
 export VLLM_HOST_IP=${HOST_IP}           # 本机 ip 地址
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1  # 优先选择和本地网卡同名的远端网卡进行通信
+
+# 以下路径按实际部署环境设置；仅在对应示例中需要
+export VLLM_SOURCE_ROOT="<vLLM 源码根目录>"
+export HCU_TOPO_CONFIG="<ROCSHMEM 拓扑配置文件>"
+export HIPBLASLT_TUNING_CONFIG="<hipBLASLt 调优配置文件>"
+export ROCBLAS_TENSILE_LIB_DIR="<rocBLAS Tensile 库目录>"
 ```
 
 ### TTFT 分段追踪
@@ -178,7 +184,7 @@ export NCCL_NET_GDR_LEVEL=7
 export NCCL_SDMA_COPY_ENABLE=0
 export NCCL_IB_HCA=mlx5_0:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_9:1
 export ROCSHMEM_HEAP_SIZE=4000000000
-export ROCSHMEM_TOPO_FILE_FORCE=/workspace/topo.config
+export ROCSHMEM_TOPO_FILE_FORCE="${HCU_TOPO_CONFIG}"
 export USE_SPE_MQP=1
 export ROCSHMEM_SQ_SIZE=1024
 export ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=256
@@ -210,7 +216,7 @@ vllm serve /models/vllm-w8a8-models/GLM-5-W8A8  \
 #### 代理服务器
 
 ```bash
-python3 /workspace/vllm/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py \
+python3 "${VLLM_SOURCE_ROOT}/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py" \
   --prefill "http://10.16.1.15:9348" "8998" \
   --decode "http://10.16.1.16:9349" \
   --port 8000
@@ -274,7 +280,7 @@ vllm serve /models/v2_6/GLM-w4a8-V2_6_test \
 #### 代理服务器
 
 ```bash
-python3 /workspace/vllm/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py \
+python3 "${VLLM_SOURCE_ROOT}/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py" \
   --prefill "http://10.16.1.15:9348" "8998" \
   --decode "http://10.16.1.18:9349" \
   --port 8000
@@ -289,8 +295,8 @@ export VLLM_HCU_USE_CUSTOM_FLASH_ATTN=1
 export GPU_MAX_HW_QUEUES=4
 export VLLM_HCU_USE_LIGHTOP_MOE_ALIGN=1
 export LMSLIM_USE_LIGHTOP=1
-export HIPBLASLT_TUNING_OVERRIDE_FILE=/workspace/rocblas/hipblaslt.config
-export ROCBLAS_TENSILE_LIBPATH=/workspace/rocblas/rocblas_hy3_fp8_zmy
+export HIPBLASLT_TUNING_OVERRIDE_FILE="${HIPBLASLT_TUNING_CONFIG}"
+export ROCBLAS_TENSILE_LIBPATH="${ROCBLAS_TENSILE_LIB_DIR}"
 export MC_ENABLE_DEST_DEVICE_AFFINITY=1
 
 LMSLIM_USE_FUSED_RMS_QUANT=1 \
@@ -361,7 +367,7 @@ export NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:
 
 export ROCSHMEM_HEAP_SIZE=4000000000
 #郑州节点需要设置
-export ROCSHMEM_TOPO_FILE_FORCE=/workspace/topo.config
+export ROCSHMEM_TOPO_FILE_FORCE="${HCU_TOPO_CONFIG}"
 export ROCSHMEM_ALLOWED_IBV_DEVICES=mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
 export USE_SPE_MQP=1
 export ROCSHMEM_SQ_SIZE=1024
@@ -440,7 +446,7 @@ export NCCL_IB_HCA=mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:
 
 export ROCSHMEM_HEAP_SIZE=4000000000
 #郑州节点需要设置
-export ROCSHMEM_TOPO_FILE_FORCE=/workspace/topo.config
+export ROCSHMEM_TOPO_FILE_FORCE="${HCU_TOPO_CONFIG}"
 export ROCSHMEM_ALLOWED_IBV_DEVICES=mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
 export USE_SPE_MQP=1
 export ROCSHMEM_SQ_SIZE=1024
@@ -481,7 +487,7 @@ vllm serve /models/Hy3-CHANNEL-FP8-w8a8-sero-ignore-from-script3 \
 #### 代理服务器
 
 ```bash
-python3 /workspace/vllm/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py \
+python3 "${VLLM_SOURCE_ROOT}/examples/online_serving/disaggregated_serving/mooncake_connector/mooncake_connector_proxy.py" \
   --prefill "http://10.16.1.15:8010" "8998" \
   --decode "http://10.16.1.16:8020" \
   --port 8000
