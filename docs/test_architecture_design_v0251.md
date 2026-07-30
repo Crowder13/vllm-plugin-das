@@ -116,8 +116,10 @@ tests/
 │   └── routing/                   # 环境变量和后端路径
 ├── integration/
 │   ├── models/                    # checkpoint、生成、logprob
+│   ├── features/                  # Prefix cache、chunked prefill、logprobs、batch
 │   ├── graph/                     # CUDA Graph capture/replay
 │   ├── lora/                      # 单 LoRA、多 LoRA、动态切换
+│   ├── parallel/                  # TP、EP、TP+EP 组合
 │   ├── spec_decode/               # MTP/Eagle/rejection/state correction
 │   ├── kv_transfer/               # Connector、失败、生命周期
 │   └── server/                    # OpenAI API、启动和关闭
@@ -735,8 +737,10 @@ tests/fixtures/artifacts.py
 tests/fixtures/resources.py
 tests/integration/
 tests/integration/models/test_qwen35_9b_smoke.py
+tests/integration/features/test_qwen3_4b_engine_features.py
 tests/integration/graph/test_qwen35_9b_graph_parity.py
 tests/integration/lora/test_qwen3_4b_lora_switching.py
+tests/integration/parallel/test_tp_ep_models.py
 tests/integration/spec_decode/test_llama2_7b_eagle_parity.py
 tests/integration/kv_transfer/test_example_connector_smoke.py
 tests/integration/server/evalscope_server.py
@@ -760,6 +764,8 @@ tests/models/deepseek_r1_gsm8k_evalscope.yaml
 python tools/run_patch_tests.py --suite model -k qwen35_9b
 python tools/run_patch_tests.py --suite model -k qwen35_9b_gsm8k_evalscope_server
 python tools/run_patch_tests.py --suite model -k qwen3_vl_8b_mmmu_evalscope_server
+python tools/run_patch_tests.py --suite model -k qwen3_4b_engine_features
+python tools/run_patch_tests.py --suite model -- -k tp_ep
 python tools/run_patch_tests.py --suite model -k qwen3_4b_lora_switching
 python tools/run_patch_tests.py --suite model -k llama2_7b_eagle
 python tools/run_patch_tests.py --suite model -k example_connector
