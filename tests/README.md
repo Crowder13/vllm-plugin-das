@@ -88,6 +88,8 @@ python tools/run_patch_tests.py --suite model -- -k qwen3_vl_8b_mmmu_evalscope_s
 python tools/run_patch_tests.py --suite model -- -k deepseek_r1_channel_fp8_gsm8k_evalscope_server
 
 # Feature smoke tests.
+python tools/run_patch_tests.py --suite model -- -k qwen3_4b_engine_features
+python tools/run_patch_tests.py --suite model -- -k tp_ep
 python tools/run_patch_tests.py --suite model -- -k qwen3_4b_lora_switching
 python tools/run_patch_tests.py --suite model -- -k llama2_7b_eagle
 python tools/run_patch_tests.py --suite model -- -k example_connector
@@ -124,4 +126,3 @@ Each config declares the model path, server arguments, EvalScope work directory,
 generation settings, dataset settings, and pass criteria. Override a model path
 with the corresponding environment variable named by the test file, for example
 `VLLM_HCU_QWEN35_9B_MODEL`.
-

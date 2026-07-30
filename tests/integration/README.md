@@ -6,8 +6,11 @@ connector, or server.
 Subdirectories:
 
 - `models/`: checkpoint loading, generation, token, and logprob comparisons.
+- `features/`: prefix caching, chunked prefill, logprobs, and mixed-length
+  batch generation.
 - `graph/`: real CUDA Graph capture/replay versus eager execution.
 - `lora/`: base, LoRA-only, LoRA+Graph, and LoRA+Spec Decode.
+- `parallel/`: TP, EP, and combined parallel execution.
 - `spec_decode/`: MTP/Eagle/rejection and batch-state correctness.
 - `kv_transfer/`: connector lifecycle and local producer/consumer integration.
 - `server/`: OpenAI-compatible server startup, EvalScope requests, and shutdown.

@@ -43,6 +43,23 @@ def available_hcu_count() -> int:
         return 0
 
 
+def require_gfx_arch(required_arch: str, label: str) -> None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip(f"{label} requires {required_arch}, but no live HCU is available")
+        properties = torch.cuda.get_device_properties(0)
+    except Exception as exc:
+        pytest.skip(f"{label} requires {required_arch}, but HCU arch is unavailable: {exc}")
+    gcn_arch = getattr(properties, "gcnArchName", None)
+    if not isinstance(gcn_arch, str):
+        pytest.skip(f"{label} requires {required_arch}, but HCU arch is unavailable")
+    current_arch = gcn_arch.split(":", 1)[0]
+    if current_arch != required_arch:
+        pytest.skip(f"{label} requires {required_arch}, got {current_arch}")
+
+
 def resolve_model_path(
     resources: HcuTestResources,
     *,
@@ -78,6 +95,7 @@ def require_model_runtime(
         if resources.strict:
             pytest.fail(message)
         pytest.skip(message)
+    _require_loadable_local_model(resources, model_path, label)
     _require_unified_attention_compatible(resources, model_path, label)
     actual_hcu_count = available_hcu_count()
     if actual_hcu_count < hcu_count:
@@ -85,6 +103,25 @@ def require_model_runtime(
             f"{label} test requires {hcu_count} HCU devices, got {actual_hcu_count}"
         )
     return model_path
+
+
+def _require_loadable_local_model(
+    resources: HcuTestResources,
+    model_path: Path,
+    label: str,
+) -> None:
+    if model_path.is_dir() and (
+        (model_path / "config.json").is_file()
+        or (model_path / "params.json").is_file()
+    ):
+        return
+    message = (
+        f"{label} model path is not a loadable local model directory: "
+        f"{model_path}; expected config.json or params.json"
+    )
+    if resources.strict:
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 def require_non_hybrid_model(
@@ -105,6 +142,7 @@ def require_non_hybrid_model(
         if resources.strict:
             pytest.fail(message)
         pytest.skip(message)
+    _require_loadable_local_model(resources, model_path, label)
     _require_unified_attention_compatible(resources, model_path, label)
     if _is_hybrid_kv_model(model_path):
         message = (
@@ -167,6 +205,8 @@ def _require_unified_attention_compatible(
     model_path: Path,
     label: str,
 ) -> None:
+    if _is_mla_attention_model(model_path):
+        return
     head_dim = _model_attention_head_dim(model_path)
     if head_dim is None or head_dim in UNIFIED_ATTENTION_HEAD_DIMS:
         return
@@ -176,7 +216,21 @@ def _require_unified_attention_compatible(
     )
     if resources.strict:
         pytest.fail(message)
-    pytest.skip(message)
+        pytest.skip(message)
+
+
+def _is_mla_attention_model(model_path: Path) -> bool:
+    config = _read_model_config(model_path)
+    if config is None:
+        return False
+    model_type = str(config.get("model_type", "")).casefold()
+    architectures = _model_architectures(model_path)
+    if model_type.startswith("deepseek"):
+        return True
+    if any("deepseek" in item.casefold() for item in architectures):
+        return True
+    mla_fields = ("qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim")
+    return any(isinstance(config.get(name), int) for name in mla_fields)
 
 
 def _model_attention_head_dim(model_path: Path) -> int | None:
@@ -258,12 +312,16 @@ def run_vllm_case(
     *,
     timeout_s: int = 900,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    log_label: str | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    log_path = _case_log_path(case, model_path)
+    if extra_env:
+        env.update(extra_env)
+    log_path = _case_log_path(log_label or case, model_path)
     command = [
         sys.executable,
         "-m",
@@ -284,7 +342,7 @@ def run_vllm_case(
         timeout=timeout_s,
         check=False,
     )
-    _write_case_log(log_path, command, result.stdout)
+    _write_case_log(log_path, command, result.stdout, env=env, extra_env=extra_env)
     if result.returncode != 0:
         raise AssertionError(
             f"vLLM integration case {case!r} failed with rc={result.returncode}\n"
@@ -314,10 +372,22 @@ def _case_log_path(case: str, model_path: Path) -> Path:
     return log_dir / f"{timestamp}_{model_name}_{case_name}.log"
 
 
-def _write_case_log(log_path: Path, command: list[str], output: str) -> None:
+def _write_case_log(
+    log_path: Path,
+    command: list[str],
+    output: str,
+    *,
+    env: dict[str, str],
+    extra_env: dict[str, str] | None,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     header = "command: " + " ".join(command) + "\n"
-    header += "environment: VLLM_HCU_USE_FLASH_ATTN_UNIFIED=1\n"
+    env_names = ["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"]
+    if extra_env:
+        env_names.extend(sorted(extra_env))
+    header += "environment: " + " ".join(
+        f"{name}={env[name]}" for name in env_names if name in env
+    ) + "\n"
     log_path.write_text(header + output, encoding="utf-8")
 
 
@@ -364,15 +434,41 @@ def _single_completion(record: Any) -> dict[str, Any]:
     if cumulative_logprob is not None and not math.isfinite(cumulative_logprob):
         raise AssertionError(f"non-finite cumulative logprob: {cumulative_logprob}")
     lora_request = getattr(record, "lora_request", None)
+    sample_logprobs = getattr(output, "logprobs", None)
+    prompt_logprobs = getattr(record, "prompt_logprobs", None)
     return {
         "prompt_token_count": len(record.prompt_token_ids or []),
         "token_ids": token_ids,
         "text": output.text,
         "finish_reason": output.finish_reason,
         "cumulative_logprob": cumulative_logprob,
+        "sample_logprob_count": _logprob_position_count(sample_logprobs),
+        "sample_top_logprob_count": _logprob_entry_count(sample_logprobs),
+        "prompt_logprob_count": _logprob_position_count(prompt_logprobs),
+        "prompt_top_logprob_count": _logprob_entry_count(prompt_logprobs),
         "lora_name": getattr(lora_request, "lora_name", None),
         "lora_int_id": getattr(lora_request, "lora_int_id", None),
     }
+
+
+def _logprob_position_count(logprobs: Any) -> int:
+    if logprobs is None:
+        return 0
+    return sum(1 for item in logprobs if item is not None)
+
+
+def _logprob_entry_count(logprobs: Any) -> int:
+    if logprobs is None:
+        return 0
+    total = 0
+    for item in logprobs:
+        if item is None:
+            continue
+        try:
+            total += len(item)
+        except TypeError:
+            total += 1
+    return total
 
 
 def _generate_with_llm(
@@ -381,6 +477,8 @@ def _generate_with_llm(
     prompts: list[str] | None = None,
     lora_request: Any = None,
     max_tokens: int = 8,
+    logprobs: int | None = 1,
+    prompt_logprobs: int | None = None,
 ) -> list[dict[str, Any]]:
     from vllm.sampling_params import SamplingParams
 
@@ -392,7 +490,8 @@ def _generate_with_llm(
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=max_tokens,
-        logprobs=1,
+        logprobs=logprobs,
+        prompt_logprobs=prompt_logprobs,
         seed=0,
     )
     outputs = llm.generate(
@@ -544,6 +643,196 @@ def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
     }
 
 
+def _case_prefix_caching_smoke(model_path: Path) -> dict[str, Any]:
+    from vllm import LLM
+
+    shared_prefix = (
+        "You are checking prefix caching on HCU. "
+        "Repeatable context: alpha beta gamma delta. "
+    ) * 16
+    prompts = [
+        shared_prefix + "Question A: answer with one short word.",
+        shared_prefix + "Question B: answer with one short word.",
+    ]
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            enable_prefix_caching=True,
+            max_model_len=1024,
+            max_num_batched_tokens=1024,
+            max_num_seqs=4,
+        )
+    )
+    try:
+        first = _generate_with_llm(llm, prompts=prompts, max_tokens=6)
+        second = _generate_with_llm(llm, prompts=prompts, max_tokens=6)
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "enable_prefix_caching": True,
+        "first": first,
+        "second": second,
+    }
+
+
+def _case_chunked_prefill_smoke(model_path: Path) -> dict[str, Any]:
+    from vllm import LLM
+
+    long_prompt = (
+        "Chunked prefill should process this repeated HCU prompt safely. "
+        "The model should continue after a long shared context. "
+    ) * 20
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            enable_chunked_prefill=True,
+            max_model_len=1024,
+            max_num_batched_tokens=256,
+            max_num_seqs=2,
+        )
+    )
+    try:
+        output = _generate_with_llm(llm, prompts=[long_prompt], max_tokens=4)
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "enable_chunked_prefill": True,
+        "output": output,
+    }
+
+
+def _case_logprobs_smoke(model_path: Path) -> dict[str, Any]:
+    from vllm import LLM
+
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            max_model_len=512,
+            max_num_batched_tokens=512,
+            max_num_seqs=2,
+        )
+    )
+    try:
+        output = _generate_with_llm(
+            llm,
+            prompts=["Return a short deterministic answer for logprob testing."],
+            max_tokens=5,
+            logprobs=3,
+            prompt_logprobs=2,
+        )
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "output": output,
+    }
+
+
+def _case_batch_mixed_lengths(model_path: Path) -> dict[str, Any]:
+    from vllm import LLM
+
+    prompts = [
+        "Short prompt:",
+        "Medium prompt: " + "count carefully " * 16,
+        "Long prompt: " + "mixed length batch scheduling on HCU " * 48,
+        "Tiny:",
+    ]
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            max_model_len=1024,
+            max_num_batched_tokens=1024,
+            max_num_seqs=4,
+        )
+    )
+    try:
+        output = _generate_with_llm(llm, prompts=prompts, max_tokens=6)
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "prompt_count": len(prompts),
+        "output": output,
+    }
+
+
+def _parallel_config_summary(llm: Any) -> dict[str, Any]:
+    engine = getattr(llm, "llm_engine", None)
+    vllm_config = getattr(engine, "vllm_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if parallel_config is None:
+        return {}
+    return {
+        "tensor_parallel_size": getattr(
+            parallel_config,
+            "tensor_parallel_size",
+            None,
+        ),
+        "pipeline_parallel_size": getattr(
+            parallel_config,
+            "pipeline_parallel_size",
+            None,
+        ),
+        "data_parallel_size": getattr(
+            parallel_config,
+            "data_parallel_size",
+            None,
+        ),
+        "enable_expert_parallel": getattr(
+            parallel_config,
+            "enable_expert_parallel",
+            None,
+        ),
+        "world_size": getattr(parallel_config, "world_size", None),
+    }
+
+
+def _case_tp_ep_smoke(
+    model_path: Path,
+    *,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    moe_backend: str,
+) -> dict[str, Any]:
+    from vllm import LLM
+
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            tensor_parallel_size=tensor_parallel_size,
+            enable_expert_parallel=True,
+            max_model_len=512,
+            max_num_batched_tokens=512,
+            max_num_seqs=2,
+            gpu_memory_utilization=gpu_memory_utilization,
+            moe_backend=moe_backend,
+        )
+    )
+    try:
+        output = _generate_with_llm(
+            llm,
+            prompts=[
+                "TP and expert parallel smoke test:",
+                "Answer briefly: HCU parallel execution is",
+            ],
+            max_tokens=4,
+        )
+        parallel_config = _parallel_config_summary(llm)
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "requested_tensor_parallel_size": tensor_parallel_size,
+        "requested_enable_expert_parallel": True,
+        "requested_gpu_memory_utilization": gpu_memory_utilization,
+        "requested_moe_backend": moe_backend,
+        "parallel_config": parallel_config,
+        "output": output,
+    }
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -554,12 +843,20 @@ def _main(argv: list[str] | None = None) -> int:
             "lora-switching",
             "spec-decode-parity",
             "kv-transfer-smoke",
+            "prefix-caching-smoke",
+            "chunked-prefill-smoke",
+            "logprobs-smoke",
+            "batch-mixed-lengths",
+            "tp-ep-smoke",
         ),
     )
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--lora-a", type=Path)
     parser.add_argument("--lora-b", type=Path)
     parser.add_argument("--draft-model", type=Path)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--moe-backend", default="auto")
     args = parser.parse_args(argv)
 
     if args.case == "smoke":
@@ -578,8 +875,23 @@ def _main(argv: list[str] | None = None) -> int:
         if args.draft_model is None:
             raise SystemExit("spec-decode-parity requires --draft-model")
         payload = _case_spec_decode_parity(args.model, draft_model=args.draft_model)
-    else:
+    elif args.case == "kv-transfer-smoke":
         payload = _case_kv_transfer_smoke(args.model)
+    elif args.case == "prefix-caching-smoke":
+        payload = _case_prefix_caching_smoke(args.model)
+    elif args.case == "chunked-prefill-smoke":
+        payload = _case_chunked_prefill_smoke(args.model)
+    elif args.case == "logprobs-smoke":
+        payload = _case_logprobs_smoke(args.model)
+    elif args.case == "batch-mixed-lengths":
+        payload = _case_batch_mixed_lengths(args.model)
+    else:
+        payload = _case_tp_ep_smoke(
+            args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            moe_backend=args.moe_backend,
+        )
     print(RESULT_PREFIX + json.dumps(payload, sort_keys=True))
     return 0
 
