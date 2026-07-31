@@ -1097,6 +1097,7 @@ def test_ubatch_list_splits_use_python_ints_and_preserve_attention_metadata():
     torch.testing.assert_close(result.is_prefilling, torch.tensor([True]))
 
 
+@pytest.mark.hcu
 def test_clean_vllm_modules_import_apply_and_second_apply_is_idempotent():
     script = r'''
 import os

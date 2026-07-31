@@ -308,6 +308,7 @@ def test_weight_installer_is_direct_idempotent_and_keeps_bindings_coherent(
     assert imported == [default_loader.__name__, default_loader.__name__]
 
 
+@pytest.mark.hcu
 def test_clean_v0251_model_loader_import_order_has_no_weight_debug_cycle():
     repo = Path(__file__).resolve().parents[2]
     target_vllm = Path(

@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import builtins
+import importlib
 import inspect
 import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Iterator
 
 import pytest
 
@@ -80,6 +83,70 @@ def _fresh_python(
         env=env,
         timeout=120,
     )
+
+
+@contextmanager
+def _cpu_safe_hcu_worker_module() -> Iterator[ModuleType]:
+    """Import the HCU Worker without loading the upstream GPU runtime.
+
+    These lifecycle tests exercise ordering around the parent Worker methods,
+    not GPU kernels.  Importing the real upstream ``gpu_worker`` pulls in
+    flash-attn at module import time, which aborts a CPU-only pytest process.
+    The fake parent is scoped to this context and every module/package binding
+    is restored before subsequent tests run.
+    """
+
+    upstream_name = "vllm.v1.worker.gpu_worker"
+    worker_utils_name = "vllm.v1.worker.utils"
+    hcu_name = "vllm_hcu.v1.worker"
+    missing = object()
+    previous_upstream = sys.modules.get(upstream_name, missing)
+    previous_worker_utils = sys.modules.get(worker_utils_name, missing)
+    previous_hcu = sys.modules.get(hcu_name, missing)
+
+    import vllm_hcu.v1 as hcu_v1_package
+
+    previous_hcu_attribute = getattr(hcu_v1_package, "worker", missing)
+
+    class Worker:
+        def load_model(self, *, load_dummy_weights: bool = False) -> None:
+            del load_dummy_weights
+
+    fake_upstream = ModuleType(upstream_name)
+    fake_upstream.Worker = Worker
+    fake_upstream.init_worker_distributed_environment = lambda *args, **kwargs: None
+    fake_worker_utils = ModuleType(worker_utils_name)
+    fake_worker_utils.request_memory = lambda *args, **kwargs: 0
+    sys.modules[upstream_name] = fake_upstream
+    sys.modules[worker_utils_name] = fake_worker_utils
+    sys.modules.pop(hcu_name, None)
+    hcu_v1_package.__dict__.pop("worker", None)
+
+    try:
+        worker_module = importlib.import_module(hcu_name)
+        yield worker_module
+    finally:
+        sys.modules.pop(hcu_name, None)
+        if previous_hcu is not missing:
+            sys.modules[hcu_name] = previous_hcu
+        if previous_hcu_attribute is missing:
+            hcu_v1_package.__dict__.pop("worker", None)
+        else:
+            hcu_v1_package.worker = previous_hcu_attribute
+        if previous_upstream is missing:
+            sys.modules.pop(upstream_name, None)
+        else:
+            sys.modules[upstream_name] = previous_upstream
+        if previous_worker_utils is missing:
+            sys.modules.pop(worker_utils_name, None)
+        else:
+            sys.modules[worker_utils_name] = previous_worker_utils
+
+
+@pytest.fixture
+def cpu_safe_hcu_worker_module() -> Iterator[ModuleType]:
+    with _cpu_safe_hcu_worker_module() as worker_module:
+        yield worker_module
 
 
 def test_plugin_entries_are_interleavable_idempotent_and_registry_backed(monkeypatch):
@@ -303,10 +370,13 @@ def test_engine_args_normal_cold_post_import_callback_still_applies():
     }
 
 
-def test_worker_applies_before_parent_init_and_validates_after_load(monkeypatch):
+def test_worker_applies_before_parent_init_and_validates_after_load(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
     from vllm_hcu.patch import runtime_state, worker as worker_dispatcher
-    from vllm_hcu.v1 import worker as worker_module
 
+    worker_module = cpu_safe_hcu_worker_module
     events: list[object] = []
     monkeypatch.setattr(
         runtime_state,
@@ -364,10 +434,13 @@ def test_worker_applies_before_parent_init_and_validates_after_load(monkeypatch)
     )
 
 
-def test_worker_does_not_terminal_validate_after_failed_parent_load(monkeypatch):
+def test_worker_does_not_terminal_validate_after_failed_parent_load(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
     from vllm_hcu.patch import worker as worker_dispatcher
-    from vllm_hcu.v1 import worker as worker_module
 
+    worker_module = cpu_safe_hcu_worker_module
     worker = object.__new__(worker_module.HcuGPUWorker)
     monkeypatch.setattr(
         worker_module.Worker,
@@ -919,8 +992,11 @@ def _fake_engine_module(events: list[object]) -> ModuleType:
 
 @pytest.mark.parametrize("launch_style", ["mp", "ray-actor"])
 def test_engine_core_proc_sets_role_before_prepare_and_after_parent(
-    monkeypatch, launch_style
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    launch_style,
 ):
+    del cpu_safe_hcu_worker_module
     from vllm_hcu.patch import worker as worker_dispatcher
     from vllm_hcu.patch.platform.framework_opt import patch_engine_core
 

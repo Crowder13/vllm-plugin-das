@@ -183,6 +183,7 @@ def hcu_mooncake():
     return importlib.import_module(patch_mooncake_connector.TARGET_MODULE)
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_trace_and_transfer_id_contract(hcu_mooncake):
     request_id = "cmpl-123e4567-e89b-12d3-a456-426614174000-extra"
     assert hcu_mooncake.transfer_id_from_req(request_id) == "xfer-123e4567-e89b-12d3-a456-426614174000"
@@ -190,6 +191,7 @@ def test_hcu_mooncake_trace_and_transfer_id_contract(hcu_mooncake):
     assert hcu_mooncake.transfer_id_from_req("plain", {"transfer_id": "x"}) == "x"
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_heterogeneous_tp_contracts(hcu_mooncake):
     assert hcu_mooncake._get_tp_ratio(4, 2) == 2
     assert hcu_mooncake._get_tp_ratio(2, 4) == -2
@@ -198,6 +200,7 @@ def test_hcu_mooncake_heterogeneous_tp_contracts(hcu_mooncake):
     assert "mismatch" in hcu_mooncake._validate_hetero_block_lens_match([4], [8], -2)
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_metadata_and_layout_contracts(hcu_mooncake):
     assert patch_mooncake_connector.apply_to_module(hcu_mooncake) is True
     assert patch_mooncake_connector.apply_to_module(hcu_mooncake) is False
@@ -216,6 +219,7 @@ def test_hcu_mooncake_metadata_and_layout_contracts(hcu_mooncake):
     assert hcu_mooncake._cache_type_sort_key("model.layers.0.indexer") == 0
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_transfer_planning_contracts(hcu_mooncake):
     src, dst, lengths = [], [], []
     hcu_mooncake._append_homogeneous_fa_layer_transfers(
@@ -232,6 +236,7 @@ def test_hcu_mooncake_transfer_planning_contracts(hcu_mooncake):
     assert (src, dst, lengths) == ([100], [220], [20])
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_pp_and_error_propagation_contracts(hcu_mooncake):
     assert hcu_mooncake._validate_hetero_slot_size_bytes(16, 32, 2) is None
     assert hcu_mooncake._validate_hetero_slot_size_bytes(16, 8, -2) is None
@@ -240,6 +245,7 @@ def test_hcu_mooncake_pp_and_error_propagation_contracts(hcu_mooncake):
         assert callable(getattr(hcu_mooncake.MooncakeConnectorWorker, method))
 
 
+@pytest.mark.hcu
 def test_hcu_mooncake_bootstrap_contracts(hcu_mooncake, monkeypatch):
     local = SimpleNamespace(
         parallel_config=SimpleNamespace(local_engines_only=True, data_parallel_index=3)

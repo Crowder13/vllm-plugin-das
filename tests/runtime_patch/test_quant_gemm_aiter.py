@@ -1426,8 +1426,13 @@ def test_scaled_mm_prequantized_scale_shape_preserves_eager_value_error():
         )
 
 
-def test_scaled_mm_prequantized_scale_shape_is_one_strict_dynamic_graph():
+def test_scaled_mm_prequantized_scale_shape_is_one_strict_dynamic_graph(monkeypatch):
     from sympy.logic.boolalg import Boolean
+
+    # Some ROCm-enabled PyTorch builds report accelerator support to Dynamo
+    # even on a CPU-only runner, which makes compilation snapshot a CUDA RNG
+    # state and initialize HIP.  This graph is deliberately CPU-only.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
     class FP8ScaledMMLinearKernel:
         _hcu_fp8_patch_applied = True
