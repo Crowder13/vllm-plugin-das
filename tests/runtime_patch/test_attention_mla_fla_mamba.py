@@ -122,7 +122,7 @@ def test_dense_attention_layer_installs_hcu_runtime_and_preserves_fallback(
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
     import vllm_hcu.model_executor.layers as hcu_layers
 
-    monkeypatch.setattr(hcu_layers, "attention_runtime", runtime)
+    monkeypatch.setattr(hcu_layers, "attention_runtime", runtime, raising=False)
     monkeypatch.setattr(adapter, "_feature_flags", lambda: (False, False))
     module = _module(
         adapter.TARGET_MODULE,
@@ -273,17 +273,9 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
 
 
 def test_attention_direct_forward_preserves_cpu_values_and_query_device():
+    from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
     from vllm_hcu.model_executor.layers.mla_runtime import torch as runtime_torch
 
-    # Importing attention_runtime requires a real vLLM custom-op registry, so
-    # exercise its pure forward body through the source module only when the
-    # runtime dependency is already available.
-    try:
-        runtime = importlib.import_module(
-            "vllm_hcu.model_executor.layers.attention_runtime"
-        )
-    except (ImportError, RuntimeError):
-        pytest.skip("vLLM custom-op registry is unavailable in the CPU unit environment")
     assert runtime_torch is torch
     calls = {}
 
@@ -336,12 +328,7 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
 
 
 def test_fused_attention_accepts_only_supported_stacked_kv_cache_layout():
-    try:
-        runtime = importlib.import_module(
-            "vllm_hcu.model_executor.layers.attention_runtime"
-        )
-    except (ImportError, RuntimeError):
-        pytest.skip("vLLM custom-op registry is unavailable in the CPU unit environment")
+    from vllm_hcu.model_executor.layers import kv_cache_utils as runtime
 
     axis_zero = torch.arange(24).reshape(2, 3, 4)
     key, value = runtime.split_kv_cache(axis_zero)

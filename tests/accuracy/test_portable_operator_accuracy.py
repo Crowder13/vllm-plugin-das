@@ -13,11 +13,11 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from vllm_hcu.model_executor.layers.attention_runtime import split_kv_cache
 from vllm_hcu.model_executor.layers.fused_moe import int8_quant_runtime
 from vllm_hcu.model_executor.layers.fused_moe.router_runtime import (
     eplb_map_to_physical_and_record,
 )
+from vllm_hcu.model_executor.layers.kv_cache_utils import split_kv_cache
 from vllm_hcu.model_executor.layers.mamba_runtime import (
     mamba_v2_nn_sharded_weight_loader,
 )
