@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU nightly
+
+on:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-nightly
+  cancel-in-progress: false
+
+jobs:
+  hardware:
+    uses: ./.github/workflows/_selected-hcu-tests.yml
+    with:
+      matrix: >-
+        [
+          {
+            "id":"nightly-accuracy-gfx936",
+            "runner":"hcu-linux-gfx936-1",
+            "arch":"gfx936",
+            "cards":1,
+            "suite":"accuracy-hcu",
+            "pytest_args":[],
+            "timeout_minutes":45,
+            "requirements":[]
+          },
+          {
+            "id":"nightly-contract-hcu-gfx936",
+            "runner":"hcu-linux-gfx936-1",
+            "arch":"gfx936",
+            "cards":1,
+            "suite":"contract-hcu",
+            "pytest_args":[],
+            "timeout_minutes":60,
+            "requirements":[]
+          },
+          {
+            "id":"nightly-single-model-gfx938",
+            "runner":"hcu-linux-gfx938-1",
+            "arch":"gfx938",
+            "cards":1,
+            "suite":"model",
+            "pytest_args":["-k","qwen35_9b or qwen3_4b or llama2_7b_eagle or example_connector"],
+            "timeout_minutes":240,
+            "requirements":[]
+          },
+          {
+            "id":"nightly-qwen35-tp-ep",
+            "runner":"hcu-linux-gfx938-4",
+            "arch":"gfx938",
+            "cards":4,
+            "suite":"model",
+            "pytest_args":["-k","qwen35_35b_a3b_tp_ep_smoke"],
+            "timeout_minutes":300,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_QWEN35_35B_A3B_MODEL",
+                "relative":"qwen3.5/Qwen3.5-35B-A3B"
+              }
+            ]
+          },
+          {
+            "id":"nightly-deepseek-tp-ep",
+            "runner":"hcu-linux-gfx938-8",
+            "arch":"gfx938",
+            "cards":8,
+            "suite":"model",
+            "pytest_args":["-k","deepseek_r1_channel_int8_tp_ep_smoke"],
+            "timeout_minutes":360,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_DEEPSEEK_R1_CHANNEL_INT8_MODEL",
+                "relative":"vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
+              }
+            ]
+          },
+          {
+            "id":"nightly-qwen35-gsm8k",
+            "runner":"hcu-linux-gfx938-1",
+            "arch":"gfx938",
+            "cards":1,
+            "suite":"model",
+            "pytest_args":["-k","qwen35_9b_gsm8k_evalscope_server"],
+            "timeout_minutes":120,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_QWEN35_9B_MODEL",
+                "relative":"qwen3.5/Qwen3.5-9B"
+              }
+            ]
+          },
+          {
+            "id":"nightly-qwen3-vl-mmmu",
+            "runner":"hcu-linux-gfx938-1",
+            "arch":"gfx938",
+            "cards":1,
+            "suite":"model",
+            "pytest_args":["-k","qwen3_vl_8b_mmmu_evalscope_server"],
+            "timeout_minutes":150,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_QWEN3_VL_8B_MODEL",
+                "relative":"qwen3/Qwen3-VL-8B-Instruct"
+              }
+            ]
+          },
+          {
+            "id":"nightly-qwen3-8b-gsm8k",
+            "runner":"hcu-linux-gfx938-1",
+            "arch":"gfx938",
+            "cards":1,
+            "suite":"model",
+            "pytest_args":["-k","qwen3_8b_gsm8k_evalscope_server"],
+            "timeout_minutes":150,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_QWEN3_8B_MODEL",
+                "relative":"qwen3/Qwen3-8B"
+              }
+            ]
+          },
+          {
+            "id":"nightly-deepseek-gsm8k",
+            "runner":"hcu-linux-gfx938-8",
+            "arch":"gfx938",
+            "cards":8,
+            "suite":"model",
+            "pytest_args":["-k","deepseek_r1_channel_fp8_gsm8k_evalscope_server"],
+            "timeout_minutes":360,
+            "requirements":[
+              {
+                "kind":"model",
+                "env":"VLLM_HCU_DEEPSEEK_R1_MODEL",
+                "relative":"DeepSeek-R1-Channel-FP8-w8a8"
+              }
+            ]
+          }
+        ]
+    permissions:
+      contents: read

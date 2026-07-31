@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU multi-node
+
+# Enable a schedule after at least one multi-node test and a coordinated
+# hcu-linux-gfx938-8x2 runner have been registered. Until then this is an
+# explicit operator action and fails closed when no tests are collected.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  multi-node:
+    runs-on:
+      - self-hosted
+      - hcu-linux-gfx938-8x2
+    timeout-minutes: 360
+    env:
+      VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_HCU_TEST_STRICT_RESOURCES: "1"
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Run multi-node suite
+        env:
+          HCU_CI_JOB_ID: weekly-multi-node
+          HCU_CI_ARCH: gfx938
+          HCU_CI_CARDS: "8"
+          HCU_CI_SUITE: distributed-multi-node
+          HCU_CI_PYTEST_ARGS_JSON: "[]"
+          HCU_CI_REQUIREMENTS_JSON: "[]"
+        run: python .github/scripts/hcu_ci/run_hcu_ci_job.py
+
+      - name: Upload multi-node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-gfx938-8x2-multi-node-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}
+          if-no-files-found: error
+          retention-days: 14
