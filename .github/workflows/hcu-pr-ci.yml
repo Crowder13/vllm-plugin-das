@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: HCU PR CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    branches:
+      - v0.25.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  static-and-select:
+    name: Static gate and test selection
+    runs-on:
+      - self-hosted
+      - hcu-linux-cpu
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_hcu: ${{ steps.select.outputs.has_hcu }}
+      groups: ${{ steps.select.outputs.groups }}
+      docs_only: ${{ steps.select.outputs.docs_only }}
+      fallback: ${{ steps.select.outputs.fallback }}
+    steps:
+      - name: Checkout PR merge revision
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: Verify patch contracts
+        run: python tools/check_patch_test_coverage.py
+
+      - name: Compile Python sources
+        run: python -m compileall -q tools tests vllm_hcu
+
+      - name: Run portable contract tests
+        run: python tools/run_patch_tests.py --suite contract
+
+      - name: Select HCU matrix
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FULL_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'full-hcu') }}
+          ACCURACY_HCU: ${{ contains(github.event.pull_request.labels.*.name, 'accuracy-hcu') }}
+        run: |
+          args=(--base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT")
+          if [[ "$FULL_HCU" == "true" ]]; then
+            args+=(--full)
+          fi
+          if [[ "$ACCURACY_HCU" == "true" ]]; then
+            args+=(--accuracy)
+          fi
+          python .github/scripts/hcu_ci/select_hcu_tests.py "${args[@]}"
+
+  authorize-hcu:
+    name: Authorize hardware execution
+    needs: static-and-select
+    runs-on:
+      - self-hosted
+      - hcu-linux-cpu
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      ready: ${{ steps.authorization.outputs.ready }}
+      authorized: ${{ steps.authorization.outputs.authorized }}
+      actor: ${{ steps.authorization.outputs.actor }}
+      permission: ${{ steps.authorization.outputs.permission }}
+    steps:
+      - name: Checkout trusted authorization helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          clean: true
+          fetch-depth: 1
+
+      - name: Verify ready-hcu label authority
+        id: authorization
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python .github/scripts/hcu_ci/check_hcu_ci_authorization.py
+
+  selected-hcu-tests:
+    name: Selected hardware tests
+    needs:
+      - static-and-select
+      - authorize-hcu
+    if: >-
+      needs.static-and-select.outputs.has_hcu == 'true' &&
+      needs.authorize-hcu.outputs.authorized == 'true'
+    uses: ./.github/workflows/_selected-hcu-tests.yml
+    with:
+      matrix: ${{ needs.static-and-select.outputs.matrix }}
+    permissions:
+      contents: read
+
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs:
+      - static-and-select
+      - authorize-hcu
+      - selected-hcu-tests
+    runs-on:
+      - self-hosted
+      - hcu-linux-cpu
+    env:
+      STATIC_RESULT: ${{ needs.static-and-select.result }}
+      AUTH_RESULT: ${{ needs.authorize-hcu.result }}
+      HCU_RESULT: ${{ needs.selected-hcu-tests.result }}
+      HAS_HCU: ${{ needs.static-and-select.outputs.has_hcu }}
+      AUTHORIZED: ${{ needs.authorize-hcu.outputs.authorized }}
+      GROUPS: ${{ needs.static-and-select.outputs.groups }}
+    steps:
+      - name: Enforce aggregate result
+        run: |
+          echo "static=$STATIC_RESULT auth=$AUTH_RESULT hcu=$HCU_RESULT"
+          echo "selected=$HAS_HCU authorized=$AUTHORIZED groups=$GROUPS"
+          if [[ "$STATIC_RESULT" != "success" ]]; then
+            echo "Static gate or selector failed."
+            exit 1
+          fi
+          if [[ "$AUTH_RESULT" != "success" ]]; then
+            echo "HCU authorization check failed."
+            exit 1
+          fi
+          if [[ "$HAS_HCU" == "true" && "$AUTHORIZED" != "true" ]]; then
+            echo "Selected HCU tests require a trusted maintainer to apply ready-hcu."
+            exit 1
+          fi
+          if [[ "$HAS_HCU" == "true" && "$HCU_RESULT" != "success" ]]; then
+            echo "One or more selected HCU jobs did not pass."
+            exit 1
+          fi

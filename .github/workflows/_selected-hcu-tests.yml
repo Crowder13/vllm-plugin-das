@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+
+name: Selected HCU tests
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: Validated JSON list produced by the HCU CI selector
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hcu:
+    name: ${{ matrix.id }}
+    if: inputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.matrix) }}
+    runs-on:
+      - self-hosted
+      - ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    concurrency:
+      group: hcu-runner-${{ matrix.runner }}
+      cancel-in-progress: false
+    env:
+      HCU_CI_JOB_ID: ${{ matrix.id }}
+      HCU_CI_ARCH: ${{ matrix.arch }}
+      HCU_CI_CARDS: ${{ matrix.cards }}
+      HCU_CI_SUITE: ${{ matrix.suite }}
+      HCU_CI_PYTEST_ARGS_JSON: ${{ toJSON(matrix.pytest_args) }}
+      HCU_CI_REQUIREMENTS_JSON: ${{ toJSON(matrix.requirements) }}
+      HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.id }}
+      VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      VLLM_HCU_TEST_STRICT_RESOURCES: "1"
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 1
+
+      - name: Run preflight and selected tests
+        run: python .github/scripts/hcu_ci/run_hcu_ci_job.py
+
+      - name: Upload HCU logs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_id }}-${{ matrix.arch }}-${{ matrix.cards }}-${{ matrix.id }}-${{ github.run_attempt }}
+          path: ${{ env.HCU_CI_JOB_ROOT }}
+          if-no-files-found: error
+          retention-days: 14

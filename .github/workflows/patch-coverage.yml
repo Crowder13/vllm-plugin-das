@@ -4,17 +4,21 @@
 name: Patch coverage
 
 on:
-  pull_request:
   push:
+    branches:
+      - v0.25.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   static-patch-gate:
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - hcu-linux-cpu
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
       - name: Verify every patch has a contract and test reference
         run: python tools/check_patch_test_coverage.py
       - name: Compile test and patch tooling
