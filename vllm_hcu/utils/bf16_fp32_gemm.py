@@ -102,7 +102,7 @@ def _jit_hipblaslt_bf16_fp32() -> Any:
 def linear_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Compute ``x @ weight.T`` with BF16 inputs and FP32 output.
 
-    On DCU/ROCm, this mirrors SGLang's fast ``hipblasLtMatmul`` path when
+    On HCU/ROCm, this mirrors SGLang's fast ``hipblasLtMatmul`` path when
     ``VLLM_USE_LINEAR_BF16_FP32_USE_BLASLT`` is enabled. Other cases fall back
     to PyTorch's native matmul.
     """

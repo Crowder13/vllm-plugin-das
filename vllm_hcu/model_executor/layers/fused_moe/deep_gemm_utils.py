@@ -20,7 +20,7 @@ import vllm_hcu.platforms.envs as henvs
 
 
 # HCU DeepEP/LightOP kernels use 256-row expert slices. Keep this separate
-# from the target's quantization block shape: it is a DCU workspace contract.
+# from the target's quantization block shape: it is an HCU workspace contract.
 _HCU_TOKEN_ALIGNMENT = 256
 
 
@@ -53,7 +53,7 @@ def compute_aligned_M_and_alignment(
     otherwise reason about the actual per-expert padding.
     """
     if current_platform.is_rocm():
-        # DCU schedulers require a conservative fixed alignment. Metadata can
+        # HCU schedulers require a conservative fixed alignment. Metadata can
         # lag a post-dispatch expert remap, so it may raise the bound but must
         # never shrink the worst-case workspace derived from the routed batch.
         alignment = max(alignment, _HCU_TOKEN_ALIGNMENT)

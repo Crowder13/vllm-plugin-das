@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Keep the v0.25.1 GPU-worker shutdown contract usable on DCU.
+"""Keep the v0.25.1 GPU-worker shutdown contract usable on HCU.
 
 vLLM v0.25.1 imports ``vllm.device_allocator.cumem`` at the end of every
 CUDA-like worker shutdown in order to release an existing allocator singleton.
-On DCU, an ordinary (non-sleep-mode) worker never imports that module, and the
+On HCU, an ordinary (non-sleep-mode) worker never imports that module, and the
 shutdown-only probe can fail while constructing ``CudaRTLibrary`` because the
 process does not have an upstream-named ``libamdhip64`` mapping.  When the
 module was not loaded before shutdown, no ``CuMemAllocator`` singleton can
@@ -32,7 +32,7 @@ from ._common import (
 )
 
 TARGET_MODULE = "vllm.v1.worker.gpu_worker"
-PATCH_ID = "worker.framework_opt.lifecycle.dcu_gpu_worker_shutdown"
+PATCH_ID = "worker.framework_opt.lifecycle.hcu_gpu_worker_shutdown"
 TARGETS = (f"{TARGET_MODULE}.Worker.shutdown",)
 
 _CUMEM_MODULE = "vllm.device_allocator.cumem"
@@ -43,8 +43,8 @@ _MISSING_CUDART_MESSAGE = (
     "libcudart is not loaded in the current process, "
     "try setting VLLM_CUDART_SO_PATH"
 )
-_MARKER = "_vllm_hcu_dcu_shutdown_applied"
-_WRAPPER = "_vllm_hcu_dcu_shutdown_wrapper"
+_MARKER = "_vllm_hcu_shutdown_applied"
+_WRAPPER = "_vllm_hcu_shutdown_wrapper"
 
 
 def _next_frame(traceback: TracebackType | None) -> TracebackType | None:

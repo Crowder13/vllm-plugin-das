@@ -19,7 +19,7 @@ notices. Modified by Hygon Information Technology Co., Ltd.
 
 ## Install
 
-vLLM-HCU v0.25.1 is a runtime plugin for the DCU vLLM v0.25.1 base package. Install
+vLLM-HCU v0.25.1 is a runtime plugin for the HCU vLLM v0.25.1 base package. Install
 the matching vLLM package first, then install this repository:
 
 ```bash

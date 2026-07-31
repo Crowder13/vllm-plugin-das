@@ -1,7 +1,7 @@
 # vLLM-HCU v0.25.1 Runtime Patch Architecture
 
 This document describes the production runtime integration between vLLM-HCU
-and the DCU vLLM 0.25 release series. It covers the code that is shipped and
+and the HCU vLLM 0.25 release series. It covers the code that is shipped and
 maintained after the source-patch migration; migration inventories, experiments,
 and historical audit evidence are intentionally outside this document.
 
@@ -27,7 +27,7 @@ The runtime integration follows these rules:
 7. Keep substantial HCU behavior in HCU-owned implementation modules, not in
    callback bodies.
 8. Let vLLM 0.25 own shared interfaces and algorithms. Retain only the minimum
-   DCU delta or a capability that the target release does not provide.
+   HCU delta or a capability that the target release does not provide.
 9. Treat `torch.compile`, Dynamo, vLLM piecewise graphs, and custom-op boundaries
    as runtime ABI. Relational symbolic values must not escape those boundaries.
 
@@ -225,7 +225,7 @@ implementations as the compute owners:
 
 - compressed-tensors selects
   `ChannelWiseTorchFP8ScaledMMLinearKernel` for Channel-FP8 linear layers;
-- the HCU scaled-mm boundary validates DCU layout and metadata, then delegates
+- the HCU scaled-mm boundary validates HCU layout and metadata, then delegates
   the dense calculation to target vLLM `triton_scaled_mm`;
 - FP8 MoE uses the target `TRITON Fp8 MoE backend`;
 - an explicit AITER FP8-MoE selection is not the supported product route.

@@ -7,7 +7,7 @@
 The shared implementation below is the vLLM v0.25.1 target module.  vLLM owns
 its public interface, custom-op schemas, and communicator lifecycle; the
 small integration block immediately before registration applies only the
-remaining HCU/DCU capability deltas.
+remaining HCU capability deltas.
 """
 import functools
 from collections.abc import Callable

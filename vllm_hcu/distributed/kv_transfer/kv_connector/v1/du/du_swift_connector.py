@@ -389,7 +389,7 @@ class DuSwiftConnector(KVConnectorBase_V1):
                     return layer[:, block_ids, ...]
                 else:
                     logger.error("🚧kv_cache not mla && gqa")
-            else: # FlashAttention_DCU
+            else:  # FlashAttention_HCU
                 # return layer[:, block_ids, ...]
                 k = layer[0]  #(num_blocks, num_kv_heads, block_size, head_size)
                 v = layer[1]  #(num_blocks, num_kv_heads, head_size, block_size)

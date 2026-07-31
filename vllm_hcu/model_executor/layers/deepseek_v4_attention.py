@@ -520,7 +520,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            # DCU/ROCm profiling shows overlap can be slower at larger token
+            # HCU/ROCm profiling shows overlap can be slower at larger token
             # counts: the q/cache and compressor branches contend for the same
             # compute/memory resources. Keep overlap threshold-gated so the env
             # switch controls eager and graph-capture paths consistently.

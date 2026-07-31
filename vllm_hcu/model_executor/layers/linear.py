@@ -1525,7 +1525,7 @@ class MinimaxM3QKVParallelLinearWithIndexer(QKVParallelLinear):
 
     The class is owned by vLLM's MiniMax-M3 model contract.  Keep its v0.25.1
     sharding and loading semantics intact while inheriting this replacement
-    module's DCU-aware column-parallel implementation.
+    module's HCU-aware column-parallel implementation.
     """
 
     def __init__(

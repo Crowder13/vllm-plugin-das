@@ -688,11 +688,11 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
 def test_gdn_custom_causal_conv_is_retired(monkeypatch):
     adapter = _adapter("patch_gdn_causal_conv1d")
 
-    def dcu_fn(*args, **kwargs):
+    def hcu_fn(*args, **kwargs):
         del args, kwargs
         raise AssertionError("retired custom causal-conv path must not be imported")
 
-    _install_fake_module(monkeypatch, "causal_conv1d", causal_conv1d_fn_dcu=dcu_fn)
+    _install_fake_module(monkeypatch, "causal_conv1d", causal_conv1d_fn_dcu=hcu_fn)
 
     module = _module(
         adapter.TARGET_MODULE,

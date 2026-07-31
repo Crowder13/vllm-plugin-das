@@ -218,7 +218,7 @@ def test_deep_gemm_replacements_keep_target_features_and_scoped_hcu_deltas():
         assert target_feature in experts_source
     assert "is_device_capability_family(120)" in batched_source
 
-    # DCU deltas are private/conditional and do not widen public constructors
+    # HCU deltas are private/conditional and do not widen public constructors
     # or apply signatures.
     assert {"_hcu_logical_n", "_hcu_logical_k"} <= {
         node.attr
@@ -638,7 +638,7 @@ def test_sparse_replacements_preserve_v0251_definition_surface_and_signatures(
             )
 
 
-def test_sparse_replacements_keep_reviewed_dcu_deltas():
+def test_sparse_replacements_keep_reviewed_hcu_deltas():
     indexer_source = (
         REPO_ROOT / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
     ).read_text(encoding="utf-8")

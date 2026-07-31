@@ -79,7 +79,7 @@ def test_setup_version_query_keeps_provenance_without_rewriting_source(
             "--short=7",
             "HEAD",
         ],
-        # The shared DCU workspace can be owned by a mounted host uid.
+        # The shared HCU workspace can be owned by a mounted host uid.
         cwd=REPO_ROOT,
         text=True,
     ).strip()

@@ -217,7 +217,7 @@ def fused_indexer_q_rope_quant(
     head_scale: float,
     is_neox: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # DCU exposes the CUDA dispatch surface through the ROCm platform enum.
+    # HCU exposes the CUDA dispatch surface through the ROCm platform enum.
     # Keep the v0.25.1 kernel contract and only widen this platform assertion.
     assert current_platform.is_cuda_alike()
     assert q.dtype == torch.bfloat16

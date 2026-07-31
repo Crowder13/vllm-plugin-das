@@ -288,7 +288,7 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
                 )
             except ModuleNotFoundError as error:
                 raise RuntimeError(
-                    "HCU FP8 DeepEP weight packing requires the DCU-specific "
+                    "HCU FP8 DeepEP weight packing requires the HCU-specific "
                     "deepgemm package; install the matching proprietary wheel"
                 ) from error
             w1_marlin = pack_int8_weight_enk_to_w6_low_latency(layer.w13_weight)
