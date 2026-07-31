@@ -56,7 +56,7 @@ def _load_hcu_management_api() -> ModuleType | None:
 
     try:
         return importlib.import_module("amdsmi")
-    except ImportError:
+    except Exception:
         return None
 
 try:

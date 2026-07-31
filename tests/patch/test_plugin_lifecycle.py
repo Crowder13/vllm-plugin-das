@@ -456,14 +456,15 @@ def test_worker_does_not_terminal_validate_after_failed_parent_load(
         worker.load_model()
 
 
-def test_hcu_management_api_load_is_lazy_and_optional(monkeypatch):
+@pytest.mark.parametrize("error_type", [ImportError, RuntimeError])
+def test_hcu_management_api_load_is_lazy_and_optional(monkeypatch, error_type):
     import vllm_hcu.platforms.hcu as hcu_module
 
     hcu_module._load_hcu_management_api.cache_clear()
     monkeypatch.setattr(
         hcu_module.importlib,
         "import_module",
-        lambda name: (_ for _ in ()).throw(ImportError(name)),
+        lambda name: (_ for _ in ()).throw(error_type("private backend detail")),
     )
     try:
         assert hcu_module._load_hcu_management_api() is None

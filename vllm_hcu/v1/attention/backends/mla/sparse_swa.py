@@ -128,7 +128,7 @@ class DeepseekSparseSWABackend(AttentionBackend):
                 from vllm.models.deepseek_v4.amd.rocm import (
                     DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
                 )
-            except ImportError:
+            except Exception:
                 raise RuntimeError(
                     "HCU sparse SWA metadata builder is unavailable in the "
                     "target vLLM installation."

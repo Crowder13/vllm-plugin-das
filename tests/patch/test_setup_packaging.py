@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from setuptools import find_namespace_packages
+import torch.utils.cpp_extension as torch_cpp_extension
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -112,3 +113,92 @@ def test_setup_has_no_version_source_or_global_git_config_mutation() -> None:
     assert "write_version_file" not in function_names
     assert '"--global"' not in source
     assert 'ROOT / "vllm_hcu" / "version.py"' not in source
+
+
+def test_setup_sanitizes_hcu_compiler_command_output() -> None:
+    tree = ast.parse((REPO_ROOT / "setup.py").read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    sanitizer = functions["_sanitize_hcu_build_output"]
+    sanitizer_source = ast.unparse(sanitizer)
+    assert "_HIP_PLATFORM_DEFINES" in sanitizer_source
+    assert "_REDACTED_HIP_PLATFORM_DEFINE" in sanitizer_source
+
+    sanitizer_nodes = [
+        node
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id
+            in {"_HIP_PLATFORM_DEFINES", "_REDACTED_HIP_PLATFORM_DEFINE"}
+        )
+        or node is sanitizer
+    ]
+    sanitizer_namespace: dict[str, object] = {
+        "torch_cpp_extension": torch_cpp_extension,
+    }
+    exec(
+        compile(
+            ast.Module(body=sanitizer_nodes, type_ignores=[]),
+            filename="setup.py",
+            mode="exec",
+        ),
+        sanitizer_namespace,
+    )
+    platform_defines = sanitizer_namespace["_HIP_PLATFORM_DEFINES"]
+    sanitize = sanitizer_namespace["_sanitize_hcu_build_output"]
+    assert isinstance(platform_defines, tuple)
+    assert platform_defines
+    assert all(isinstance(flag, str) for flag in platform_defines)
+    assert callable(sanitize)
+    compiler_output = f"compiler {' '.join(platform_defines)} failed"
+    sanitized = sanitize(compiler_output)
+    if any(flag in sanitized for flag in platform_defines):
+        raise AssertionError("HIP platform compiler define was not sanitized")
+    assert "<hcu-platform-define>" in sanitized
+
+    ninja_boundary = functions["_sanitized_ninja_build"]
+    boundary_source = ast.unparse(ninja_boundary)
+    assert "original_run_ninja_build(build_directory, False" in boundary_source
+    assert "_sanitize_hcu_build_output(str(error))" in boundary_source
+
+    build_ext = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CustomBuildExt"
+    )
+    run_method = next(
+        node
+        for node in build_ext.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_sanitized_ninja_build"
+        for node in ast.walk(run_method)
+    )
+
+    extension_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CUDAExtension"
+    )
+    extra_compile_args = next(
+        keyword.value
+        for keyword in extension_call.keywords
+        if keyword.arg == "extra_compile_args"
+    )
+    compile_args = ast.literal_eval(extra_compile_args)
+    assert not any(
+        argument.startswith("-D__HIP_PLATFORM_")
+        for arguments in compile_args.values()
+        for argument in arguments
+    )

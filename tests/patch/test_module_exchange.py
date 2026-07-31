@@ -459,12 +459,27 @@ def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
         "DeepSeekV4MTP",
     )
 
-    native_entry = (
-        TARGET_VLLM_ROOT / "vllm/models/deepseek_v4/__init__.py"
-    ).read_text(encoding="utf-8")
-    assert "if current_platform.is_rocm():" in native_entry
-    assert "from .amd.model import DeepseekV4ForCausalLM" in native_entry
-    assert "from .amd.mtp import DeepSeekV4MTP" in native_entry
+    native_entry_tree = ast.parse(
+        (
+            TARGET_VLLM_ROOT / "vllm/models/deepseek_v4/__init__.py"
+        ).read_text(encoding="utf-8")
+    )
+    platform_branch = next(
+        node
+        for node in native_entry_tree.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "current_platform.is_rocm()"
+    )
+    native_imports = {
+        alias.name
+        for node in platform_branch.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTP",
+    } <= native_imports
 
 
 def test_aiter_replacement_preserves_v0251_public_method_surface_and_ar_lifecycle():
@@ -663,13 +678,46 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
     )[1].split("    def _build_deepseek_v4_metadata(", 1)[0]
     assert "current_platform.is_rocm()" not in build_tile_scheduler
     assert "current_platform.is_xpu()" in build_tile_scheduler
-    get_builder_cls = sparse_swa_source.split(
-        "    def get_builder_cls(", 1
-    )[1].split("    def get_kv_cache_shape(", 1)[0]
-    assert "from vllm.models.deepseek_v4.amd.rocm import (" in get_builder_cls
-    assert "except ImportError:" in get_builder_cls
-    assert "HCU sparse SWA metadata builder is unavailable" in get_builder_cls
-    assert ") from None" in get_builder_cls
+    sparse_swa_tree = ast.parse(sparse_swa_source)
+    backend_class = next(
+        node
+        for node in sparse_swa_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "DeepseekSparseSWABackend"
+    )
+    get_builder_cls = next(
+        node
+        for node in backend_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "get_builder_cls"
+    )
+    platform_branch = next(
+        node
+        for node in get_builder_cls.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "current_platform.is_rocm()"
+    )
+    import_boundary = next(
+        node for node in platform_branch.body if isinstance(node, ast.Try)
+    )
+    imported_names = {
+        alias.name
+        for node in import_boundary.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "DeepseekV4ROCMAiterSparseSWAMetadataBuilder" in imported_names
+    assert len(import_boundary.handlers) == 1
+    handler = import_boundary.handlers[0]
+    assert isinstance(handler.type, ast.Name)
+    assert handler.type.id == "Exception"
+    failure = next(node for node in handler.body if isinstance(node, ast.Raise))
+    assert isinstance(failure.exc, ast.Call)
+    assert isinstance(failure.exc.func, ast.Name)
+    assert failure.exc.func.id == "RuntimeError"
+    assert isinstance(failure.cause, ast.Constant)
+    assert failure.cause.value is None
+    message = ast.literal_eval(failure.exc.args[0])
+    assert message.startswith("HCU sparse SWA metadata builder is unavailable")
 
 
 def test_replacement_paths_are_validated_without_importing():

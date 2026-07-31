@@ -7,8 +7,11 @@ import os
 import shutil
 import subprocess
 import multiprocessing
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Union
+
+import torch.utils.cpp_extension as torch_cpp_extension
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 from setuptools import find_namespace_packages, setup
@@ -23,6 +26,51 @@ ROOT = Path(__file__).parent.resolve()
 BASE_VERSION = "0.25.1"
 
 ADD_GIT_VERSION = os.environ.get("ADD_GIT_VERSION", "1") == "1"
+
+# PyTorch injects required HIP platform defines into every HCU compiler
+# command. Keep the compiler contract intact while preventing those private
+# spellings from being copied into package build logs.
+_HIP_PLATFORM_DEFINES = tuple(
+    flag
+    for flag in torch_cpp_extension.COMMON_HIP_FLAGS
+    if flag.startswith("-D__HIP_PLATFORM_")
+)
+_REDACTED_HIP_PLATFORM_DEFINE = "<hcu-platform-define>"
+
+
+def _sanitize_hcu_build_output(output: str) -> str:
+    for platform_define in _HIP_PLATFORM_DEFINES:
+        output = output.replace(
+            platform_define,
+            _REDACTED_HIP_PLATFORM_DEFINE,
+        )
+    return output
+
+
+@contextmanager
+def _sanitized_ninja_build():
+    original_run_ninja_build = torch_cpp_extension._run_ninja_build
+
+    def run_ninja_build(build_directory, _verbose, error_prefix):
+        try:
+            # PyTorch normally invokes Ninja verbosely and prints complete
+            # compiler commands. Quiet successful builds; retain sanitized
+            # compiler diagnostics when a build fails.
+            original_run_ninja_build(
+                build_directory,
+                False,
+                error_prefix,
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                _sanitize_hcu_build_output(str(error))
+            ) from None
+
+    torch_cpp_extension._run_ninja_build = run_ninja_build
+    try:
+        yield
+    finally:
+        torch_cpp_extension._run_ninja_build = original_run_ninja_build
 
 
 # =========================================================
@@ -97,7 +145,7 @@ ext_modules = [
         define_macros=[('TORCH_EXTENSION_NAME', 'hcu_ops')], 
         extra_compile_args={
             'cxx': ['-O3'],
-            'nvcc': ['-O3', '-D__HIP_PLATFORM_AMD__=1', '-fno-gpu-rdc']
+            'nvcc': ['-O3', '-fno-gpu-rdc']
         }
     )
 ]
@@ -109,7 +157,8 @@ ext_modules = [
 class CustomBuildExt(BuildExtension.with_options(use_ninja=True)):
     def run(self):
         # 1. 调用父类的 run()，这会根据 MAX_JOBS 环境并行编译
-        super().run()
+        with _sanitized_ninja_build():
+            super().run()
         
         # 2. 编译完成后，执行你的拷贝逻辑
         for ext in self.extensions:
