@@ -436,7 +436,7 @@ def check_aiter_fused_qk_rmsnorm() -> bool:
     (AITER >= PR #2958) and the old public name ``fused_qk_rmsnorm``
     (AITER >= PR #2442).
 
-    TODO(rbrugaro-amd): remove the legacy fused_qk_rmsnorm path once
+    TODO: remove the legacy fused_qk_rmsnorm path once
     AITER stabilizes the API (https://github.com/ROCm/aiter/issues/3207).
     """
     global _AITER_HAS_FUSED_QK_RMSNORM
@@ -1319,7 +1319,7 @@ def _fused_mla_dual_rms_norm_impl(
             k_eps=x2_epsilon,
         )
 
-    # TODO(rbrugaro-amd): remove the legacy fused_qk_rmsnorm path once
+    # TODO: remove the legacy fused_qk_rmsnorm path once
     # AITER stabilizes the API (https://github.com/ROCm/aiter/issues/3207).
     if hasattr(aiter_ops, "fused_qk_rmsnorm"):
         return aiter_ops.fused_qk_rmsnorm(
@@ -1503,7 +1503,7 @@ _OPS_REGISTERED = False
 
 
 class rocm_aiter_ops:
-    """ROCm AITER operations wrapper for AMD GPU acceleration in vLLM.
+    """ROCm AITER operations wrapper for vLLM.
 
     This class centralizes the import and registration of AITER ops,
     and provides a unified interface for checking if AITER is enabled.

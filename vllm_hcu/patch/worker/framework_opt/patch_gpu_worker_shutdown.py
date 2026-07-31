@@ -6,9 +6,9 @@ vLLM v0.25.1 imports ``vllm.device_allocator.cumem`` at the end of every
 CUDA-like worker shutdown in order to release an existing allocator singleton.
 On HCU, an ordinary (non-sleep-mode) worker never imports that module, and the
 shutdown-only probe can fail while constructing ``CudaRTLibrary`` because the
-process does not have an upstream-named ``libamdhip64`` mapping.  When the
-module was not loaded before shutdown, no ``CuMemAllocator`` singleton can
-exist, so only that exact failed tail probe is an HCU no-op.
+required runtime-library mapping is unavailable.  When the module was not
+loaded before shutdown, no ``CuMemAllocator`` singleton can exist, so only
+that exact failed tail probe is an HCU no-op.
 
 The target method remains responsible for every other lifecycle step.  This
 adapter deliberately does not catch missing-runtime failures when cumem was

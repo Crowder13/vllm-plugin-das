@@ -450,7 +450,6 @@ class CustomAllreduce {
  public:
   int rank_;
   int world_size_;
-  // Full NVLink or xGMI connection between GPUs.
   bool fully_connected_;
 
   RankSignals sg_;

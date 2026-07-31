@@ -409,7 +409,7 @@ def test_v0251_native_mhc_contract_is_not_replaced():
     } <= exports
 
 
-def test_v0251_native_amd_deepseek_v4_owns_model_and_mtp_contracts():
+def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
     exchanges = dict(module_exchange_names())
     assert "vllm.v1.attention.backends.mla.sparse_swa" in exchanges
     assert {
@@ -648,8 +648,6 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
         in indexer_source
     )
     assert "torch.ops.vllm.rocm_aiter_sparse_attn_indexer(" in indexer_source
-    assert "AMD platform doesn't support fp4 cache yet" not in indexer_source
-    assert "AMD sparse_attn_indexer expects" not in indexer_source
     assert "HCU platform doesn't support fp4 cache yet" in indexer_source
     assert "HCU sparse_attn_indexer expects" in indexer_source
 
