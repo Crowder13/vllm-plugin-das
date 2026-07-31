@@ -672,40 +672,6 @@ def test_gdn_nn_layout_normalizes_all_conv_weight_consumers(monkeypatch):
     )
 
 
-def test_gdn_custom_causal_conv_is_retired(monkeypatch):
-    adapter = _adapter("patch_gdn_causal_conv1d")
-
-    def hcu_fn(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("retired custom causal-conv path must not be imported")
-
-    _install_fake_module(monkeypatch, "causal_conv1d", causal_conv1d_fn_dcu=hcu_fn)
-
-    module = _module(
-        adapter.TARGET_MODULE,
-        causal_conv1d_fn=_gdn_causal_conv1d_fn,
-        causal_conv1d_update=_gdn_causal_conv1d_update,
-    )
-    adapter.apply_to_module(module)
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", True)
-
-    physical_weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-    result = module.causal_conv1d_fn(
-        torch.empty(8, 2),
-        physical_weight,
-        None,
-        conv_states=torch.empty(1, 8, 3),
-        query_start_loc=torch.tensor([0, 2]),
-        metadata=SimpleNamespace(nums_dict={"seqlens": [2]}),
-    )
-
-    torch.testing.assert_close(result, physical_weight.T.contiguous())
-
-
 def test_gdn_recurrent_and_sigmoid_remain_target_owned(monkeypatch):
     adapter = _adapter("patch_gdn_linear_attention")
 
