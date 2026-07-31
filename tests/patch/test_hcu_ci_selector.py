@@ -58,6 +58,32 @@ def test_moe_change_selects_kernel_and_tp_ep_jobs() -> None:
     assert fallback is False
 
 
+def test_model_runtime_change_selects_text_vl_and_pooling_models() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/integration/model_runtime.py"],
+    )
+    assert {job["id"] for job in jobs}.issuperset(
+        {
+            "qwen35-smoke",
+            "qwen25-models",
+            "qwen3-pooling",
+        }
+    )
+    assert "model-tests" in groups
+    assert fallback is False
+
+
+def test_protocol_change_selects_protocol_server_job() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/integration/server/test_qwen3_protocol_features.py"],
+    )
+    assert {job["id"] for job in jobs} == {"qwen3-protocol"}
+    assert "qwen3-protocol-tests" in groups
+    assert fallback is False
+
+
 def test_unknown_production_change_uses_conservative_fallback() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

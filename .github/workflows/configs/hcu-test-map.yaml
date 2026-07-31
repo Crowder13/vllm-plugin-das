@@ -224,6 +224,70 @@
         }
       ]
     },
+    "qwen25-models": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen25_15b_openai_server_smoke or qwen25_vl_3b_image_mrope_smoke"
+      ],
+      "timeout_minutes": 120,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN25_15B_MODEL",
+          "relative": "qwen2.5/Qwen2.5-1.5B-Instruct"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN25_VL_3B_MODEL",
+          "relative": "vllm-gptq-models/qwen2.5/Qwen2.5-VL-3B-Instruct"
+        }
+      ]
+    },
+    "qwen3-pooling": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke"
+      ],
+      "timeout_minutes": 90,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN3_EMBEDDING_06B_MODEL",
+          "relative": "qwen3/Qwen3-Embedding-0.6B"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN3_RERANKER_06B_MODEL",
+          "relative": "qwen3/Qwen3-Reranker-0.6B"
+        }
+      ]
+    },
+    "qwen3-protocol": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_protocol"
+      ],
+      "timeout_minutes": 90,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_PROTOCOL_MODEL",
+          "relative": "qwen3/Qwen3-4B"
+        }
+      ]
+    },
     "qwen35-gsm8k": {
       "runner": "hcu-linux-gfx938-1",
       "arch": "gfx938",
@@ -413,10 +477,47 @@
     },
     "model-tests": {
       "patterns": [
-        "tests/integration/models/**"
+        "tests/integration/models/test_qwen35_9b_smoke.py",
+        "tests/integration/model_runtime.py"
       ],
       "jobs": [
-        "qwen35-smoke"
+        "qwen35-smoke",
+        "qwen25-models",
+        "qwen3-pooling"
+      ]
+    },
+    "qwen25-tests": {
+      "patterns": [
+        "tests/integration/models/test_qwen25_models.py",
+        "tests/integration/server/test_qwen25_server_smoke.py"
+      ],
+      "jobs": [
+        "qwen25-models"
+      ]
+    },
+    "pooling-tests": {
+      "patterns": [
+        "tests/integration/models/test_qwen3_pooling_models.py"
+      ],
+      "jobs": [
+        "qwen3-pooling"
+      ]
+    },
+    "protocol-tests": {
+      "patterns": [
+        "tests/integration/server/openai_server.py"
+      ],
+      "jobs": [
+        "qwen3-protocol",
+        "qwen25-models"
+      ]
+    },
+    "qwen3-protocol-tests": {
+      "patterns": [
+        "tests/integration/server/test_qwen3_protocol_features.py"
+      ],
+      "jobs": [
+        "qwen3-protocol"
       ]
     },
     "qwen35-evalscope": {
