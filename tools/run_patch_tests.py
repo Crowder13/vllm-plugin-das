@@ -35,6 +35,11 @@ CONTRACT_TESTS = (
     "tests/accuracy",
     "tests/gemma4_test",
 )
+HCU_CONTRACT_TESTS = (
+    "tests/patch",
+    "tests/runtime_patch",
+    "tests/gemma4_test",
+)
 INTEGRATION_TESTS = ("tests/integration",)
 SINGLE_NODE_DISTRIBUTED_TESTS = ("tests/distributed/single_node",)
 MULTI_NODE_DISTRIBUTED_TESTS = ("tests/distributed/multi_node",)
@@ -45,6 +50,7 @@ SUITES = {
     "accuracy": ("tests/accuracy",),
     "accuracy-hcu": ("tests/accuracy",),
     "contract": CONTRACT_TESTS,
+    "contract-hcu": HCU_CONTRACT_TESTS,
     "integration-smoke": INTEGRATION_TESTS,
     "model": INTEGRATION_TESTS,
     "distributed-single-node": SINGLE_NODE_DISTRIBUTED_TESTS,
@@ -59,6 +65,7 @@ SUITE_PYTEST_ARGS = {
     "accuracy": ("-m", "not hcu"),
     "accuracy-hcu": ("-m", "hcu"),
     "contract": ("-m", "not hcu"),
+    "contract-hcu": ("-m", "hcu and not model and not multi_node"),
     "integration-smoke": (
         "-m",
         "not slow and not multi_hcu and not multi_node",

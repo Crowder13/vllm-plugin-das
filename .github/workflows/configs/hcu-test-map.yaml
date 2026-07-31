@@ -1,0 +1,462 @@
+{
+  "version": 1,
+  "production_patterns": [
+    "vllm_hcu/**",
+    "csrc/**",
+    "setup.py",
+    "pyproject.toml",
+    "requirements*.txt"
+  ],
+  "non_hcu_patterns": [
+    "docs/**",
+    "**/*.md",
+    "*.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "test_patterns": [
+    "tests/**"
+  ],
+  "fallback_jobs": [
+    "accuracy-gfx936",
+    "contract-hcu-gfx936",
+    "integration-smoke-gfx938"
+  ],
+  "accuracy_jobs": [
+    "qwen35-gsm8k",
+    "qwen3-8b-gsm8k",
+    "qwen3-vl-mmmu",
+    "deepseek-gsm8k"
+  ],
+  "jobs": {
+    "accuracy-gfx936": {
+      "runner": "hcu-linux-gfx936-1",
+      "arch": "gfx936",
+      "cards": 1,
+      "suite": "accuracy-hcu",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
+    },
+    "accuracy-gfx938": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "accuracy-hcu",
+      "pytest_args": [],
+      "timeout_minutes": 30,
+      "requirements": []
+    },
+    "contract-hcu-gfx936": {
+      "runner": "hcu-linux-gfx936-1",
+      "arch": "gfx936",
+      "cards": 1,
+      "suite": "contract-hcu",
+      "pytest_args": [],
+      "timeout_minutes": 45,
+      "requirements": []
+    },
+    "integration-smoke-gfx938": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "integration-smoke",
+      "pytest_args": [],
+      "timeout_minutes": 45,
+      "requirements": []
+    },
+    "qwen35-smoke": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen35_9b_greedy_generation_smoke"
+      ],
+      "timeout_minutes": 45,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN35_9B_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        }
+      ]
+    },
+    "qwen35-graph": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen35_9b_eager_graph_token_parity"
+      ],
+      "timeout_minutes": 60,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_GRAPH_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        }
+      ]
+    },
+    "engine-features": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_4b_engine_features"
+      ],
+      "timeout_minutes": 90,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_ENGINE_FEATURE_MODEL",
+          "relative": "qwen3/Qwen3-4B"
+        }
+      ]
+    },
+    "lora": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_4b_lora_adapter_switching"
+      ],
+      "timeout_minutes": 60,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_LORA_BASE_MODEL",
+          "relative": "qwen3/Qwen3-4B"
+        },
+        {
+          "kind": "path",
+          "env": "VLLM_HCU_QWEN3_4B_LORA_A",
+          "relative": "lora/TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0"
+        },
+        {
+          "kind": "path",
+          "env": "VLLM_HCU_QWEN3_4B_LORA_B",
+          "relative": "lora/nissenj/Qwen3-4B-lora-v2"
+        }
+      ]
+    },
+    "spec-decode": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "llama2_7b_eagle_spec_decode_token_parity"
+      ],
+      "timeout_minutes": 90,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_SPEC_TARGET_MODEL",
+          "relative": "vllm-optest-models/TheBloke/Llama-2-7B-fp16"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_SPEC_DRAFT_MODEL",
+          "relative": "vllm-optest-models/yuhuili/EAGLE-llama2-chat-7B"
+        }
+      ]
+    },
+    "kv-transfer": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "example_connector"
+      ],
+      "timeout_minutes": 60,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_KV_TRANSFER_MODEL",
+          "relative": "qwen3/Qwen3-4B"
+        }
+      ]
+    },
+    "qwen35-tp-ep": {
+      "runner": "hcu-linux-gfx938-4",
+      "arch": "gfx938",
+      "cards": 4,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen35_35b_a3b_tp_ep_smoke"
+      ],
+      "timeout_minutes": 240,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN35_35B_A3B_MODEL",
+          "relative": "qwen3.5/Qwen3.5-35B-A3B"
+        }
+      ]
+    },
+    "deepseek-tp-ep": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "deepseek_r1_channel_int8_tp_ep_smoke"
+      ],
+      "timeout_minutes": 300,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_R1_CHANNEL_INT8_MODEL",
+          "relative": "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8"
+        }
+      ]
+    },
+    "qwen35-gsm8k": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen35_9b_gsm8k_evalscope_server"
+      ],
+      "timeout_minutes": 90,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN35_9B_MODEL",
+          "relative": "qwen3.5/Qwen3.5-9B"
+        }
+      ]
+    },
+    "qwen3-vl-mmmu": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_vl_8b_mmmu_evalscope_server"
+      ],
+      "timeout_minutes": 120,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN3_VL_8B_MODEL",
+          "relative": "qwen3/Qwen3-VL-8B-Instruct"
+        }
+      ]
+    },
+    "qwen3-8b-gsm8k": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "qwen3_8b_gsm8k_evalscope_server"
+      ],
+      "timeout_minutes": 120,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN3_8B_MODEL",
+          "relative": "qwen3/Qwen3-8B"
+        }
+      ]
+    },
+    "deepseek-gsm8k": {
+      "runner": "hcu-linux-gfx938-8",
+      "arch": "gfx938",
+      "cards": 8,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "deepseek_r1_channel_fp8_gsm8k_evalscope_server"
+      ],
+      "timeout_minutes": 360,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_DEEPSEEK_R1_MODEL",
+          "relative": "DeepSeek-R1-Channel-FP8-w8a8"
+        }
+      ]
+    }
+  },
+  "groups": {
+    "ci": {
+      "patterns": [
+        ".github/workflows/**",
+        ".github/workflows/configs/**",
+        ".github/scripts/hcu_ci/**",
+        "tools/run_patch_tests.py",
+        "tests/patch/test_hcu_ci_*.py"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "contract-hcu-gfx936",
+        "integration-smoke-gfx938"
+      ]
+    },
+    "platform-runtime": {
+      "patterns": [
+        "vllm_hcu/__init__.py",
+        "vllm_hcu/platforms/**",
+        "vllm_hcu/patch/**",
+        "vllm_hcu/v1/**",
+        "vllm_hcu/runtime_compat/**"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "contract-hcu-gfx936",
+        "integration-smoke-gfx938",
+        "qwen35-smoke"
+      ]
+    },
+    "attention-graph": {
+      "patterns": [
+        "vllm_hcu/attention/**",
+        "vllm_hcu/ops/**attention*",
+        "vllm_hcu/**graph*",
+        "tests/integration/graph/**"
+      ],
+      "jobs": [
+        "accuracy-gfx938",
+        "qwen35-graph"
+      ]
+    },
+    "engine-features": {
+      "patterns": [
+        "vllm_hcu/**cache*",
+        "vllm_hcu/**scheduler*",
+        "tests/integration/features/**"
+      ],
+      "jobs": [
+        "engine-features"
+      ]
+    },
+    "lora": {
+      "patterns": [
+        "vllm_hcu/lora/**",
+        "vllm_hcu/**lora*",
+        "tests/integration/lora/**"
+      ],
+      "jobs": [
+        "lora"
+      ]
+    },
+    "spec-decode": {
+      "patterns": [
+        "vllm_hcu/**spec_decode*",
+        "vllm_hcu/v1/spec_decode/**",
+        "tests/integration/spec_decode/**"
+      ],
+      "jobs": [
+        "spec-decode"
+      ]
+    },
+    "kv-transfer": {
+      "patterns": [
+        "vllm_hcu/**kv_transfer*",
+        "tests/integration/kv_transfer/**"
+      ],
+      "jobs": [
+        "contract-hcu-gfx936",
+        "kv-transfer"
+      ]
+    },
+    "moe": {
+      "patterns": [
+        "vllm_hcu/model_executor/layers/fused_moe/**",
+        "vllm_hcu/model_executor/layers/quantization/**",
+        "vllm_hcu/patch/worker/**moe*",
+        "tests/gemma4_test/**"
+      ],
+      "jobs": [
+        "accuracy-gfx936",
+        "qwen35-tp-ep"
+      ]
+    },
+    "parallel-tests": {
+      "patterns": [
+        "tests/integration/parallel/**"
+      ],
+      "jobs": [
+        "qwen35-tp-ep",
+        "deepseek-tp-ep"
+      ]
+    },
+    "deepseek": {
+      "patterns": [
+        "vllm_hcu/models/deepseek*",
+        "vllm_hcu/**deepseek*",
+        "tests/integration/server/test_evalscope_deepseek*"
+      ],
+      "jobs": [
+        "deepseek-tp-ep",
+        "deepseek-gsm8k"
+      ]
+    },
+    "model-tests": {
+      "patterns": [
+        "tests/integration/models/**"
+      ],
+      "jobs": [
+        "qwen35-smoke"
+      ]
+    },
+    "qwen35-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_qwen35_9b_gsm8k.py",
+        "tests/models/qwen35_9b_gsm8k_evalscope.yaml"
+      ],
+      "jobs": [
+        "qwen35-gsm8k"
+      ]
+    },
+    "qwen3-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_qwen3_8b_gsm8k.py",
+        "tests/models/qwen3_8b_gsm8k_evalscope.yaml"
+      ],
+      "jobs": [
+        "qwen3-8b-gsm8k"
+      ]
+    },
+    "qwen3-vl-evalscope": {
+      "patterns": [
+        "tests/integration/server/test_evalscope_qwen3_vl_8b_mmmu.py",
+        "tests/models/qwen3_vl_8b_mmmu_evalscope.yaml"
+      ],
+      "jobs": [
+        "qwen3-vl-mmmu"
+      ]
+    },
+    "evalscope-runner": {
+      "patterns": [
+        "tests/integration/server/evalscope_server.py",
+        "tests/integration/server/test_evalscope_report_threshold.py"
+      ],
+      "jobs": [
+        "qwen35-gsm8k",
+        "qwen3-8b-gsm8k",
+        "qwen3-vl-mmmu",
+        "deepseek-gsm8k"
+      ]
+    }
+  }
+}
