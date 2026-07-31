@@ -758,6 +758,185 @@ def _case_batch_mixed_lengths(model_path: Path) -> dict[str, Any]:
     }
 
 
+def _case_embedding_smoke(model_path: Path) -> dict[str, Any]:
+    from vllm import LLM
+
+    prompts = [
+        "HCU inference runtime",
+        "HCU inference runtime",
+        "A completely unrelated cooking recipe",
+    ]
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            runner="pooling",
+            max_model_len=512,
+            max_num_batched_tokens=512,
+            max_num_seqs=4,
+        )
+    )
+    try:
+        outputs = llm.embed(prompts, use_tqdm=False)
+        embeddings = [record.outputs.embedding for record in outputs]
+    finally:
+        _shutdown_llm(llm)
+
+    def cosine(left: list[float], right: list[float]) -> float:
+        numerator = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(value * value for value in left))
+        right_norm = math.sqrt(sum(value * value for value in right))
+        if left_norm == 0 or right_norm == 0:
+            raise AssertionError("embedding model returned a zero vector")
+        return numerator / (left_norm * right_norm)
+
+    return {
+        "count": len(embeddings),
+        "hidden_size": len(embeddings[0]),
+        "identical_cosine": cosine(embeddings[0], embeddings[1]),
+        "unrelated_cosine": cosine(embeddings[0], embeddings[2]),
+        "all_finite": all(
+            math.isfinite(value)
+            for embedding in embeddings
+            for value in embedding
+        ),
+    }
+
+
+def _case_reranker_smoke(model_path: Path) -> dict[str, Any]:
+    from transformers import AutoTokenizer
+    from vllm import LLM
+    from vllm.sampling_params import SamplingParams
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+    )
+    prefix = (
+        "<|im_start|>system\nJudge whether the Document meets the "
+        "requirements based on the Query and the Instruct provided. "
+        'Note that the answer can only be "yes" or "no".'
+        "<|im_end|>\n<|im_start|>user\n"
+    )
+    suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    query = "What is the capital of China?"
+    documents = [
+        "The capital of China is Beijing.",
+        "Whales are marine mammals that live in oceans.",
+    ]
+    prompts = [
+        prefix
+        + "<Instruct>: Given a question, retrieve a passage that answers it\n"
+        + f"<Query>: {query}\n<Document>: {document}"
+        + suffix
+        for document in documents
+    ]
+    true_token = tokenizer("yes", add_special_tokens=False).input_ids[0]
+    false_token = tokenizer("no", add_special_tokens=False).input_ids[0]
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=1,
+        logprobs=2,
+        logprob_token_ids=[true_token, false_token],
+        allowed_token_ids=[true_token, false_token],
+    )
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            max_model_len=1024,
+            max_num_batched_tokens=1024,
+            max_num_seqs=2,
+        )
+    )
+    try:
+        outputs = llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=False,
+        )
+        scores: list[float] = []
+        for record in outputs:
+            logprobs = record.outputs[0].logprobs
+            if not logprobs or not logprobs[0]:
+                raise AssertionError("reranker did not return token logprobs")
+            first = logprobs[0]
+            missing = {true_token, false_token}.difference(first)
+            if missing:
+                raise AssertionError(
+                    "reranker omitted requested label logprobs: "
+                    f"missing={sorted(missing)}, returned={sorted(first)}"
+                )
+            true_logprob = first[true_token].logprob
+            false_logprob = first[false_token].logprob
+            true_score = math.exp(true_logprob)
+            false_score = math.exp(false_logprob)
+            scores.append(true_score / (true_score + false_score))
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "scores": scores,
+        "relevant_index": max(range(len(scores)), key=scores.__getitem__),
+    }
+
+
+def _case_vl_image_smoke(model_path: Path) -> dict[str, Any]:
+    from PIL import Image
+    from transformers import AutoProcessor
+    from vllm import LLM
+    from vllm.sampling_params import SamplingParams
+
+    image = Image.new("RGB", (64, 32), color=(220, 30, 30))
+    processor = AutoProcessor.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {
+                    "type": "text",
+                    "text": "What is the dominant color? Answer with one word.",
+                },
+            ],
+        }
+    ]
+    prompt = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    llm = LLM(
+        **_llm_kwargs(
+            model_path,
+            enforce_eager=True,
+            max_model_len=1024,
+            max_num_batched_tokens=1024,
+            max_num_seqs=1,
+            limit_mm_per_prompt={"image": 1},
+        )
+    )
+    try:
+        records = llm.generate(
+            {
+                "prompt": prompt,
+                "multi_modal_data": {"image": image},
+            },
+            SamplingParams(temperature=0, max_tokens=8, seed=0),
+            use_tqdm=False,
+        )
+        output = _single_completion(records[0])
+    finally:
+        _shutdown_llm(llm)
+    return {
+        "image_size": list(image.size),
+        "prompt_has_image_token": "image" in prompt.casefold(),
+        "output": output,
+    }
+
+
 def _parallel_config_summary(llm: Any) -> dict[str, Any]:
     engine = getattr(llm, "llm_engine", None)
     vllm_config = getattr(engine, "vllm_config", None)
@@ -847,6 +1026,9 @@ def _main(argv: list[str] | None = None) -> int:
             "chunked-prefill-smoke",
             "logprobs-smoke",
             "batch-mixed-lengths",
+            "embedding-smoke",
+            "reranker-smoke",
+            "vl-image-smoke",
             "tp-ep-smoke",
         ),
     )
@@ -885,6 +1067,12 @@ def _main(argv: list[str] | None = None) -> int:
         payload = _case_logprobs_smoke(args.model)
     elif args.case == "batch-mixed-lengths":
         payload = _case_batch_mixed_lengths(args.model)
+    elif args.case == "embedding-smoke":
+        payload = _case_embedding_smoke(args.model)
+    elif args.case == "reranker-smoke":
+        payload = _case_reranker_smoke(args.model)
+    elif args.case == "vl-image-smoke":
+        payload = _case_vl_image_smoke(args.model)
     else:
         payload = _case_tp_ep_smoke(
             args.model,

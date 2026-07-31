@@ -5,7 +5,8 @@ connector, or server.
 
 Subdirectories:
 
-- `models/`: checkpoint loading, generation, token, and logprob comparisons.
+- `models/`: checkpoint loading, generation, vision/M-RoPE, embedding, reranker,
+  token, and logprob comparisons.
 - `features/`: prefix caching, chunked prefill, logprobs, and mixed-length
   batch generation.
 - `graph/`: real CUDA Graph capture/replay versus eager execution.
@@ -13,7 +14,8 @@ Subdirectories:
 - `parallel/`: TP, EP, and combined parallel execution.
 - `spec_decode/`: MTP/Eagle/rejection and batch-state correctness.
 - `kv_transfer/`: connector lifecycle and local producer/consumer integration.
-- `server/`: OpenAI-compatible server startup, EvalScope requests, and shutdown.
+- `server/`: OpenAI/Anthropic protocol features, structured output, tool calls,
+  EvalScope requests, startup, and shutdown.
 
 The default integration target is one local HCU. Tests needing more resources
 must use the corresponding pytest markers.
