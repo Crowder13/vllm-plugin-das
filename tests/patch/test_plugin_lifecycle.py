@@ -383,6 +383,119 @@ def test_worker_does_not_terminal_validate_after_failed_parent_load(monkeypatch)
         worker.load_model()
 
 
+def test_hcu_management_api_load_is_lazy_and_optional(monkeypatch):
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    hcu_module._load_hcu_management_api.cache_clear()
+    monkeypatch.setattr(
+        hcu_module.importlib,
+        "import_module",
+        lambda name: (_ for _ in ()).throw(ImportError(name)),
+    )
+    try:
+        assert hcu_module._load_hcu_management_api() is None
+    finally:
+        hcu_module._load_hcu_management_api.cache_clear()
+
+
+def test_hcu_topology_missing_dependency_disables_custom_allreduce(monkeypatch):
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        hcu_module,
+        "_load_hcu_management_api",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        hcu_module.logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message),
+    )
+
+    assert hcu_module.HCUPlatform.is_fully_connected([0, 1]) is False
+    assert warnings == [
+        "HCU management dependency is unavailable; "
+        "custom all-reduce will be disabled."
+    ]
+
+
+def test_hcu_topology_query_and_cleanup_fail_closed(monkeypatch):
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    events: list[str] = []
+    warnings: list[str] = []
+
+    def fail_query():
+        events.append("query")
+        raise RuntimeError("private backend detail")
+
+    def fail_cleanup():
+        events.append("cleanup")
+        raise RuntimeError("private cleanup detail")
+
+    api = SimpleNamespace(
+        amdsmi_init=lambda: events.append("init"),
+        amdsmi_get_processor_handles=fail_query,
+        amdsmi_shut_down=fail_cleanup,
+    )
+    monkeypatch.setattr(
+        hcu_module,
+        "_load_hcu_management_api",
+        lambda: api,
+    )
+    monkeypatch.setattr(
+        hcu_module.logger,
+        "warning_once",
+        lambda message, *args, **kwargs: warnings.append(message),
+    )
+
+    assert hcu_module.HCUPlatform.is_fully_connected([0, 1]) is False
+    assert events == ["init", "query", "cleanup"]
+    assert warnings == [
+        "HCU topology detection failed; custom all-reduce will be disabled.",
+        "HCU management cleanup failed.",
+    ]
+
+
+def test_hcu_topology_direct_links_preserve_success(monkeypatch):
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    events: list[object] = []
+    api = SimpleNamespace(
+        amdsmi_init=lambda: events.append("init"),
+        amdsmi_get_processor_handles=lambda: ["zero", "one", "two"],
+        amdsmi_topo_get_link_type=lambda source, target: (
+            events.append((source, target))
+            or {"hops": 1, "type": 2}
+        ),
+        amdsmi_shut_down=lambda: events.append("cleanup"),
+    )
+    monkeypatch.setattr(
+        hcu_module,
+        "_load_hcu_management_api",
+        lambda: api,
+    )
+
+    assert hcu_module.HCUPlatform.is_fully_connected([0, 2]) is True
+    assert events == ["init", ("zero", "two"), "cleanup"]
+
+
+def test_hcu_device_discovery_hides_backend_error(monkeypatch):
+    import vllm_hcu.platforms.hcu as hcu_module
+
+    monkeypatch.setattr(hcu_module.torch.cuda, "_is_compiled", lambda: True)
+    monkeypatch.setattr(
+        hcu_module.torch.cuda,
+        "_device_count_amdsmi",
+        lambda: (_ for _ in ()).throw(RuntimeError("private backend detail")),
+    )
+    hcu_module._rocm_device_count_stateless.cache_clear()
+
+    with pytest.raises(RuntimeError, match="^HCU device discovery failed\\.$"):
+        hcu_module._rocm_device_count_stateless(None)
+
+
 def test_platform_defaults_prearm_worker_before_aiter_import(monkeypatch):
     import torch
 

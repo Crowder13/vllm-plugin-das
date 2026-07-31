@@ -124,9 +124,15 @@ class DeepseekSparseSWABackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
         if current_platform.is_rocm():
-            from vllm.models.deepseek_v4.amd.rocm import (
-                DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
-            )
+            try:
+                from vllm.models.deepseek_v4.amd.rocm import (
+                    DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
+                )
+            except ImportError:
+                raise RuntimeError(
+                    "HCU sparse SWA metadata builder is unavailable in the "
+                    "target vLLM installation."
+                ) from None
 
             return DeepseekV4ROCMAiterSparseSWAMetadataBuilder
         return DeepseekSparseSWAMetadataBuilder

@@ -887,9 +887,9 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
+        assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
-            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+            "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
         if self.skip_k_cache_insert or not rocm_aiter_ops.is_enabled():
             from vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse import (
@@ -945,9 +945,9 @@ class V32SparseAttnIndexer(SparseAttnIndexer):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
+        assert not self.use_fp4_cache, "HCU platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
-            "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
+            "HCU sparse_attn_indexer expects a single FP8 q_quant tensor"
         )
         return torch.ops.vllm.hcu_sparse_attn_indexer(
             hidden_states,

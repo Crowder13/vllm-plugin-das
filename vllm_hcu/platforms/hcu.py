@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+import importlib
 import os
-import torch
-import regex as re
-import vllm.envs as envs
 from datetime import timedelta
-from functools import cache, lru_cache, wraps
+from functools import cache, lru_cache
+from types import ModuleType
 from typing import TYPE_CHECKING
+
+import regex as re
+import torch
+import vllm.envs as envs
 from torch.distributed import PrefixStore, ProcessGroup
 from torch.distributed.distributed_c10d import is_nccl_available
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 from vllm.platforms.interface import DeviceCapability, Platform, PlatformEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
+
 from vllm_hcu import _ensure_platform_plugin_ready
 
 if TYPE_CHECKING:
@@ -46,19 +50,14 @@ def get_hcu_flash_attn_mode() -> str:
     # after this early platform module is imported.
     return henvs.resolve_hcu_flash_attn_mode(explicit_mode)
 
-try:
-    from amdsmi import (
-        AmdSmiException,
-        amdsmi_get_gpu_asic_info,
-        amdsmi_get_gpu_device_uuid,
-        amdsmi_get_processor_handles,
-        amdsmi_init,
-        amdsmi_shut_down,
-        amdsmi_topo_get_link_type,
-        amdsmi_topo_get_numa_node_number,
-    )
-except ImportError as e:
-    logger.warning("Failed to import from amdsmi with %r", e)
+@cache
+def _load_hcu_management_api() -> ModuleType | None:
+    """Load the optional device-management API without exposing vendor errors."""
+
+    try:
+        return importlib.import_module("amdsmi")
+    except ImportError:
+        return None
 
 try:
     import vllm._C  # noqa: F401
@@ -89,31 +88,19 @@ def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int
         return 0
     # ROCm uses amdsmi instead of nvml for stateless device count
     # This requires a sufficiently modern version of Torch 2.4.0
-    raw_count = (
-        torch.cuda._device_count_amdsmi()
-        if (hasattr(torch.cuda, "_device_count_amdsmi"))
-        else -1
-    )
-    r = torch._C._cuda_getDeviceCount() if raw_count < 0 else raw_count
-    return r
-
-
-# AMDSMI utils
-# Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
-# all the related functions work on real physical device ids.
-# the major benefit of using AMDSMI is that it will not initialize CUDA
-
-
-def with_amdsmi_context(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        amdsmi_init()
-        try:
-            return fn(*args, **kwargs)
-        finally:
-            amdsmi_shut_down()
-
-    return wrapper
+    try:
+        raw_count = (
+            torch.cuda._device_count_amdsmi()
+            if hasattr(torch.cuda, "_device_count_amdsmi")
+            else -1
+        )
+        return (
+            torch._C._cuda_getDeviceCount()
+            if raw_count < 0
+            else raw_count
+        )
+    except Exception:
+        raise RuntimeError("HCU device discovery failed.") from None
 
 @cache
 def flash_attn_triton_available() -> bool:
@@ -130,11 +117,20 @@ def flash_attn_triton_available() -> bool:
 
 @cache
 def _get_gcn_arch_name() -> str:
-    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
-    return GPU_ARCH.split(':')[0]
+    # Platform discovery also runs in CPU-only lint and contract jobs.  Do not
+    # initialize the HIP runtime when no accelerator is available.
+    if not torch.cuda.is_available():
+        return ""
+    try:
+        GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    except (AssertionError, RuntimeError):
+        # vLLM's ROCm platform bootstrap can make ``is_available`` report true
+        # on a build host that has the driver stack but no usable device.
+        return ""
+    return GPU_ARCH.split(":")[0]
 
 
-_ON_GFX93X =  any(arch in _get_gcn_arch_name() for arch in ["gfx936", "gfx938"])
+_ON_GFX93X = any(arch in _get_gcn_arch_name() for arch in ["gfx936", "gfx938"])
 _ON_GFX938 = "gfx938" in _get_gcn_arch_name()
 
 
@@ -447,24 +443,45 @@ class HCUPlatform(Platform):
         torch.cuda.manual_seed_all(seed)
 
     @classmethod
-    @with_amdsmi_context
     def is_fully_connected(cls, physical_device_ids: list[int]) -> bool:
-        """
-        Query if the set of gpus are fully connected by xgmi (1 hop)
-        """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
-        for i, handle in enumerate(handles):
-            for j, peer_handle in enumerate(handles):
-                if i < j:
-                    try:
-                        link_type = amdsmi_topo_get_link_type(handle, peer_handle)
-                        # type is 2 for XGMI
-                        if link_type["hops"] != 1 or link_type["type"] != 2:
-                            return False
-                    except AmdSmiException as error:
-                        logger.error("AMD 1 hop XGMI detection failed.", exc_info=error)
+        """Check whether all selected devices have a direct high-speed link."""
+
+        api = _load_hcu_management_api()
+        if api is None:
+            logger.warning_once(
+                "HCU management dependency is unavailable; "
+                "custom all-reduce will be disabled."
+            )
+            return False
+
+        initialized = False
+        try:
+            api.amdsmi_init()
+            initialized = True
+            all_handles = api.amdsmi_get_processor_handles()
+            handles = [all_handles[index] for index in physical_device_ids]
+            for index, handle in enumerate(handles):
+                for peer_handle in handles[index + 1 :]:
+                    link = api.amdsmi_topo_get_link_type(
+                        handle,
+                        peer_handle,
+                    )
+                    # Value 2 is the management API's direct high-speed-link type.
+                    if link["hops"] != 1 or link["type"] != 2:
                         return False
-        return True
+            return True
+        except Exception:
+            logger.warning_once(
+                "HCU topology detection failed; "
+                "custom all-reduce will be disabled."
+            )
+            return False
+        finally:
+            if initialized:
+                try:
+                    api.amdsmi_shut_down()
+                except Exception:
+                    logger.warning_once("HCU management cleanup failed.")
 
 
     @classmethod

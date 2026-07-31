@@ -648,6 +648,10 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
         in indexer_source
     )
     assert "torch.ops.vllm.rocm_aiter_sparse_attn_indexer(" in indexer_source
+    assert "AMD platform doesn't support fp4 cache yet" not in indexer_source
+    assert "AMD sparse_attn_indexer expects" not in indexer_source
+    assert "HCU platform doesn't support fp4 cache yet" in indexer_source
+    assert "HCU sparse_attn_indexer expects" in indexer_source
 
     sparse_swa_source = (
         REPO_ROOT / "vllm_hcu/v1/attention/backends/mla/sparse_swa.py"
@@ -661,6 +665,13 @@ def test_sparse_replacements_keep_reviewed_hcu_deltas():
     )[1].split("    def _build_deepseek_v4_metadata(", 1)[0]
     assert "current_platform.is_rocm()" not in build_tile_scheduler
     assert "current_platform.is_xpu()" in build_tile_scheduler
+    get_builder_cls = sparse_swa_source.split(
+        "    def get_builder_cls(", 1
+    )[1].split("    def get_kv_cache_shape(", 1)[0]
+    assert "from vllm.models.deepseek_v4.amd.rocm import (" in get_builder_cls
+    assert "except ImportError:" in get_builder_cls
+    assert "HCU sparse SWA metadata builder is unavailable" in get_builder_cls
+    assert ") from None" in get_builder_cls
 
 
 def test_replacement_paths_are_validated_without_importing():
