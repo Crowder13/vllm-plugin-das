@@ -800,6 +800,25 @@ def test_proposer_sidecar_init_cplb_fix_rocm_preservation_and_custom_sp_padding(
     assert prepared.num_kv_actual_tokens == 5
 
 
+def test_proposer_registers_flashmla_sparse_metadata_once() -> None:
+    from vllm.v1.attention.backends.mla.flashmla_sparse import (
+        FlashMLASparseMetadata,
+    )
+    from vllm_hcu.v1.spec_decode import proposer_runtime
+
+    proposer = SimpleNamespace(allowed_attn_types=(str,))
+    config = _proposer_config()
+
+    proposer_runtime.initialize_proposer(
+        SimpleNamespace(), proposer, config, "cpu", None
+    )
+    proposer_runtime.initialize_proposer(
+        SimpleNamespace(), proposer, config, "cpu", None
+    )
+
+    assert proposer.allowed_attn_types == (str, FlashMLASparseMetadata)
+
+
 def test_proposer_lightly_cp_atomic_metadata_and_forward_context_chain(
     monkeypatch: pytest.MonkeyPatch,
 ):
