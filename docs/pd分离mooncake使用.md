@@ -22,7 +22,7 @@ Mooncake 旨在提升大语言模型（LLM）的推理效率，尤其是在对�
 
 ### 下载和安装
 
-mooncake 代码仓库：http://42.228.13.241:10068/dcutoolkit/deeplearing/mooncake
+mooncake 代码仓库：[HYGON-AI/Mooncake](https://github.com/HYGON-AI/Mooncake)
 
 mooncake whl 包（ubuntu2204）路径：http://pypi.sourcefind.cn:666/das_nightly/dtk2604-rc4-mooncake/+f/79c/add379d74452d/mooncake_transfer_engine-0.3.10.post1+das.opt1.dtk2604.2605131137.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl
 
