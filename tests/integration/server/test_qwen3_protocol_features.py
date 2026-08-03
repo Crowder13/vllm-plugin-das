@@ -108,6 +108,81 @@ def test_openai_chat_jinja_reasoning_and_logprobs(
     assert isinstance(message.get("content"), (str, type(None)))
 
 
+def test_openai_seeded_top_k_top_p_sampling(
+    qwen3_protocol_server: OpenAIServer,
+) -> None:
+    server = qwen3_protocol_server
+    request = {
+        "model": server.model_name,
+        "messages": [
+            {"role": "user", "content": "Name one color in one word."}
+        ],
+        "enable_thinking": False,
+        "temperature": 0.7,
+        "top_k": 8,
+        "top_p": 0.8,
+        "seed": 2026,
+        "max_completion_tokens": 8,
+    }
+    first = _assert_success(server.post("/v1/chat/completions", request), server)
+    second = _assert_success(server.post("/v1/chat/completions", request), server)
+
+    first_message = first["choices"][0]["message"]
+    second_message = second["choices"][0]["message"]
+    assert isinstance(first_message["content"], str)
+    assert first_message["content"]
+    assert first_message["content"] == second_message["content"]
+
+
+def test_openai_metrics_endpoint_reports_request_observability(
+    qwen3_protocol_server: OpenAIServer,
+) -> None:
+    server = qwen3_protocol_server
+    response = server.get_text("/metrics")
+
+    assert response.status == 200, (
+        f"metrics request failed: {response.text[:1000]!r}; "
+        f"server_log={server.log_path}"
+    )
+    assert "vllm:num_requests_running" in response.text
+    assert "vllm:request_success" in response.text
+
+
+def test_openai_chat_streaming_with_usage(
+    qwen3_protocol_server: OpenAIServer,
+) -> None:
+    server = qwen3_protocol_server
+    response = server.post_sse(
+        "/v1/chat/completions",
+        {
+            "model": server.model_name,
+            "messages": [
+                {"role": "user", "content": "Answer with the number 4."}
+            ],
+            "temperature": 0,
+            "max_completion_tokens": 16,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status == 200
+    assert response.events[-1].data == "[DONE]"
+    chunks = [event.data for event in response.events if isinstance(event.data, dict)]
+    assert chunks
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    assert any(
+        choice.get("delta", {}).get("content")
+        for chunk in chunks
+        for choice in chunk.get("choices", [])
+    )
+    usage = [chunk.get("usage") for chunk in chunks if chunk.get("usage")]
+    assert usage
+    assert usage[-1]["prompt_tokens"] > 0
+    assert usage[-1]["completion_tokens"] > 0
+
+
 def test_openai_json_mode_and_json_schema(
     qwen3_protocol_server: OpenAIServer,
 ) -> None:
@@ -259,6 +334,35 @@ def test_anthropic_messages_protocol(
     assert body["role"] == "assistant"
     assert body["content"]
     assert body["usage"]["input_tokens"] > 0
+
+
+def test_anthropic_messages_streaming(
+    qwen3_protocol_server: OpenAIServer,
+) -> None:
+    server = qwen3_protocol_server
+    response = server.post_sse(
+        "/v1/messages",
+        {
+            "model": server.model_name,
+            "max_tokens": 8,
+            "temperature": 0,
+            "stream": True,
+            "messages": [
+                {"role": "user", "content": "Answer with one number: 2 + 2."}
+            ],
+        },
+        headers={
+            "x-api-key": "EMPTY",
+            "anthropic-version": "2023-06-01",
+        },
+    )
+
+    assert response.status == 200
+    event_types = [event.event for event in response.events]
+    assert event_types[0] == "message_start"
+    assert "content_block_delta" in event_types
+    assert "message_delta" in event_types
+    assert event_types[-1] == "message_stop"
 
 
 def test_openai_request_length_rejection_and_truncation(

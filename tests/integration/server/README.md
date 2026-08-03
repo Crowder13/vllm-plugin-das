@@ -7,9 +7,13 @@ Current coverage:
 - `test_qwen3_protocol_features.py` starts one `Qwen3-4B` server and verifies
   completions, chat/Jinja rendering, reasoning and logprobs, JSON mode,
   JSON Schema, EBNF grammar, named function calls, Anthropic Messages,
-  request-length rejection, truncation, and `ignore_eos`.
+  streaming, seeded top-k/top-p sampling, Prometheus metrics, request-length
+  rejection, truncation, and `ignore_eos`.
 - `test_qwen25_server_smoke.py` verifies that `Qwen2.5-1.5B-Instruct`
   starts as an OpenAI-compatible chat service.
+- `test_qwen3_pooling_server.py` starts Qwen3 embedding and reranking models
+  with the pooling runner, and verifies `/v1/embeddings`, `/score`, and
+  `/rerank` responses.
 - `test_evalscope_qwen3_8b_gsm8k.py` starts a single-HCU, eager-mode
   `Qwen3-8B` server and runs a 10-sample EvalScope GSM8K smoke test.
 - `test_evalscope_qwen35_9b_gsm8k.py` starts a single-HCU, eager-mode

@@ -111,6 +111,64 @@ class ProtocolResponse:
 
 
 @dataclass(frozen=True)
+class ProtocolTextResponse:
+    status: int
+    text: str
+
+
+@dataclass(frozen=True)
+class ProtocolStreamEvent:
+    event: str | None
+    data: dict[str, Any] | str
+
+
+@dataclass(frozen=True)
+class ProtocolStreamResponse:
+    status: int
+    events: list[ProtocolStreamEvent]
+
+
+def _parse_sse_events(raw: bytes) -> list[ProtocolStreamEvent]:
+    events: list[ProtocolStreamEvent] = []
+    event_type: str | None = None
+    data_lines: list[str] = []
+
+    def emit() -> None:
+        nonlocal event_type
+        if not data_lines:
+            event_type = None
+            return
+        payload = "\n".join(data_lines)
+        data_lines.clear()
+        if payload == "[DONE]":
+            data: dict[str, Any] | str = payload
+        else:
+            try:
+                decoded = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                raise AssertionError(
+                    "stream response contained invalid SSE JSON"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise AssertionError("stream response event was not a JSON object")
+            data = decoded
+        events.append(ProtocolStreamEvent(event=event_type, data=data))
+        event_type = None
+
+    for line in raw.decode(errors="replace").splitlines():
+        if not line:
+            emit()
+        elif line.startswith("event:"):
+            event_type = line.removeprefix("event:").strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.removeprefix("data:").lstrip())
+    emit()
+    if not events:
+        raise AssertionError("stream response did not contain SSE events")
+    return events
+
+
+@dataclass(frozen=True)
 class OpenAIServer:
     base_url: str
     model_name: str
@@ -118,6 +176,25 @@ class OpenAIServer:
 
     def log_tail(self) -> str:
         return _log_tail(self.log_path)
+
+    def get_text(
+        self,
+        path: str,
+        *,
+        timeout_s: int = 30,
+    ) -> ProtocolTextResponse:
+        request = Request(self.base_url + path, method="GET")
+        try:
+            with urlopen(request, timeout=timeout_s) as response:
+                return ProtocolTextResponse(
+                    status=response.status,
+                    text=response.read().decode(errors="replace"),
+                )
+        except HTTPError as exc:
+            return ProtocolTextResponse(
+                status=exc.code,
+                text=exc.read().decode(errors="replace"),
+            )
 
     def post(
         self,
@@ -160,6 +237,41 @@ class OpenAIServer:
             )
         return ProtocolResponse(status=status, body=body)
 
+    def post_sse(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        timeout_s: int = 180,
+    ) -> ProtocolStreamResponse:
+        request_headers = {
+            "Accept": "text/event-stream",
+            "Authorization": "Bearer EMPTY",
+            "Content-Type": "application/json",
+        }
+        if headers:
+            request_headers.update(headers)
+        request = Request(
+            self.base_url + path,
+            data=json.dumps(payload).encode(),
+            headers=request_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout_s) as response:
+                status = response.status
+                raw = response.read()
+        except HTTPError as exc:
+            status = exc.code
+            raw = exc.read()
+        if status != 200:
+            raise AssertionError(
+                f"{path} stream request failed with status={status}; "
+                f"server_log={self.log_path}"
+            )
+        return ProtocolStreamResponse(status=status, events=_parse_sse_events(raw))
+
 
 @contextmanager
 def serve_openai_protocol_model(
@@ -167,6 +279,7 @@ def serve_openai_protocol_model(
     *,
     startup_timeout_s: int = 1800,
     enable_qwen3_parsers: bool = False,
+    extra_args: list[str] | None = None,
 ) -> Iterator[OpenAIServer]:
     if enable_qwen3_parsers:
         _require_structured_output_dependencies()
@@ -206,6 +319,8 @@ def serve_openai_protocol_model(
             "--reasoning-parser",
             "qwen3",
         ]
+    if extra_args:
+        command.extend(extra_args)
     env = os.environ.copy()
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
