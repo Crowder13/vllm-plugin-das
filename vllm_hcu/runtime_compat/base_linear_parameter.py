@@ -263,17 +263,57 @@ def _install_base_linear_parameter_compat_unlocked(
         )
 
     def base_column(self, loaded_weight, is_quantization=False):
+        if not _nn_layout_enabled() or is_quantization:
+            return originals[_BASE_COLUMN](self, loaded_weight)
+        if getattr(self.data, "ndim", None) != 2:
+            return originals[_BASE_COLUMN](self, loaded_weight)
+
+        # ``weight_loader_v2`` can create a bare BasevLLMParameter rather
+        # than _ColumnvLLMParameter. Its physical HCU layout is [in, out],
+        # while an HF column-parallel weight remains [out, in].
+        if loaded_weight.transpose(0, 1).shape == self.data.shape:
+            return originals[_BASE_COLUMN](self, loaded_weight.t())
+        shard_size = self.data.shape[1]
+        loaded_weight = loaded_weight.narrow(
+            0,
+            self.tp_rank * shard_size,
+            shard_size,
+        ).t()
         return originals[_BASE_COLUMN](self, loaded_weight)
 
     def base_row(self, loaded_weight, is_quantization=False):
+        if not _nn_layout_enabled() or is_quantization:
+            return originals[_BASE_ROW](self, loaded_weight)
+        if getattr(self.data, "ndim", None) != 2:
+            return originals[_BASE_ROW](self, loaded_weight)
+
+        # See base_column: row-parallel weights shard the HF input dimension,
+        # which becomes physical dimension 0 after the NN-layout transpose.
+        if loaded_weight.transpose(0, 1).shape == self.data.shape:
+            return originals[_BASE_ROW](self, loaded_weight.t())
+        shard_size = self.data.shape[0]
+        loaded_weight = loaded_weight.narrow(
+            1,
+            self.tp_rank * shard_size,
+            shard_size,
+        ).t()
         return originals[_BASE_ROW](self, loaded_weight)
 
     def column(self, loaded_weight, is_quantization=False):
         if not _nn_layout_enabled() or is_quantization:
             return originals[_COLUMN](self, loaded_weight)
+
         storage_dim = _nn_storage_dim(self.data, self.output_dim)
         if storage_dim is None:
             return originals[_COLUMN](self, loaded_weight)
+
+        # vLLM may pass either the complete logical checkpoint tensor or a
+        # tensor that has already been narrowed to this TP rank.  The latter
+        # is common for Mamba weights loaded through weight_loader_v2.  Do not
+        # narrow an already-local shard a second time.
+        if loaded_weight.transpose(0, 1).shape == self.data.shape:
+            self.data.copy_(loaded_weight.t())
+            return
 
         shard_size = self.data.shape[storage_dim]
         loaded_weight = loaded_weight.narrow(
@@ -281,7 +321,14 @@ def _install_base_linear_parameter_compat_unlocked(
             self.tp_rank * shard_size,
             shard_size,
         ).t()
-        assert self.data.shape == loaded_weight.shape
+        if self.data.shape != loaded_weight.shape:
+            raise AssertionError(
+                "HCU NN-layout column weight shape mismatch: "
+                f"parameter={tuple(self.data.shape)}, "
+                f"loaded={tuple(loaded_weight.shape)}, "
+                f"output_dim={self.output_dim}, "
+                f"tp_rank={getattr(self, 'tp_rank', None)}"
+            )
         self.data.copy_(loaded_weight)
 
     def merged_column(self, loaded_weight, **kwargs):
@@ -304,11 +351,14 @@ def _install_base_linear_parameter_compat_unlocked(
             )
 
         param_data = self.data.narrow(storage_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim,
-            self.tp_rank * shard_size,
-            shard_size,
-        ).t()
+        if loaded_weight.transpose(0, 1).shape == param_data.shape:
+            loaded_weight = loaded_weight.t()
+        else:
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim,
+                self.tp_rank * shard_size,
+                shard_size,
+            ).t()
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -335,11 +385,14 @@ def _install_base_linear_parameter_compat_unlocked(
 
         shard_rank = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
         param_data = self.data.narrow(storage_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim,
-            shard_rank * shard_size,
-            shard_size,
-        ).t()
+        if loaded_weight.transpose(0, 1).shape == param_data.shape:
+            loaded_weight = loaded_weight.t()
+        else:
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim,
+                shard_rank * shard_size,
+                shard_size,
+            ).t()
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

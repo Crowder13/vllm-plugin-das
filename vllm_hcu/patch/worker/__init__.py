@@ -227,10 +227,12 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
+    _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
-    # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched.
+    # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
+    # the GDN adapters.
     _CallbackSpec(_adapter("op_opt", "patch_gdn_causal_conv1d")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),

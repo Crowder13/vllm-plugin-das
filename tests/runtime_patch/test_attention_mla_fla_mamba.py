@@ -406,6 +406,43 @@ def test_mamba_nn_sharded_loader_cpu_numeric():
     torch.testing.assert_close(param, loaded)
 
 
+def test_mamba1_conv_weight_keeps_causal_conv_layout(monkeypatch):
+    adapter = _adapter("patch_mamba_mixer")
+
+    class Weight:
+        def __init__(self, data):
+            self.data = data
+            self.weight_loader = lambda param, loaded: None
+
+    class MambaMixer:
+        def __init__(self, hidden_size, ssm_state_size, conv_kernel_size,
+                     intermediate_size, time_step_rank, use_conv_bias, use_bias,
+                     use_rms_norm, rms_norm_has_weight=True, rms_norm_eps=1e-5,
+                     activation="silu", is_lora_enabled=False, model_config=None,
+                     cache_config=None, prefix=""):
+            del hidden_size, ssm_state_size, time_step_rank, use_conv_bias, use_bias
+            del use_rms_norm, rms_norm_has_weight, rms_norm_eps, activation
+            del is_lora_enabled, model_config, cache_config, prefix
+            self.conv1d = SimpleNamespace(
+                weight=Weight(
+                    torch.empty(conv_kernel_size, 1, intermediate_size)
+                ),
+                tp_rank=0,
+            )
+
+    module = _module(adapter.TARGET_MODULE, MambaMixer=MambaMixer)
+    adapter.apply_to_module(module)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_USE_NN", True)
+    instance = MambaMixer(4, 1, 4, 6, 1, True, False, True)
+    assert instance.conv1d.weight.data.shape == (6, 1, 4)
+
+    loaded = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4)
+    instance.conv1d.weight.weight_loader(instance.conv1d.weight, loaded)
+    torch.testing.assert_close(instance.conv1d.weight.data, loaded)
+
+
 def test_mamba_mixer_init_converts_conv_buffer_to_nn_layout(monkeypatch):
     adapter = _adapter("patch_mamba_mixer2")
 

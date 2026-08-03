@@ -184,6 +184,14 @@ def test_nn_layout_loaders_transpose_and_use_physical_dimensions(
     install_base_linear_parameter_compat(module)
 
     full_column = torch.arange(12).reshape(4, 3)
+    base_column = _instance(
+        module.BasevLLMParameter,
+        data=torch.zeros(3, 2, dtype=full_column.dtype),
+        tp_rank=1,
+    )
+    base_column.load_column_parallel_weight(full_column)
+    torch.testing.assert_close(base_column.data, full_column[2:4].t())
+
     column = _instance(
         module._ColumnvLLMParameter,
         data=torch.zeros(3, 2, dtype=full_column.dtype),
@@ -192,6 +200,29 @@ def test_nn_layout_loaders_transpose_and_use_physical_dimensions(
     )
     column.load_column_parallel_weight(full_column)
     torch.testing.assert_close(column.data, full_column[2:4].t())
+
+    # vLLM's v2 loader may already provide the local logical shard.  The
+    # NN-layout adapter must not narrow that shard a second time.
+    local_column = _instance(
+        module._ColumnvLLMParameter,
+        data=torch.zeros(3, 2, dtype=full_column.dtype),
+        output_dim=0,
+        tp_rank=1,
+    )
+    local_column.load_column_parallel_weight(full_column[2:4])
+    torch.testing.assert_close(local_column.data, full_column[2:4].t())
+
+    # Equal logical and physical shapes do not imply equal layouts.  Square
+    # checkpoint matrices still require the NN-layout transpose.
+    square_weight = torch.arange(9).reshape(3, 3)
+    square_column = _instance(
+        module._ColumnvLLMParameter,
+        data=torch.zeros_like(square_weight),
+        output_dim=0,
+        tp_rank=0,
+    )
+    square_column.load_column_parallel_weight(square_weight)
+    torch.testing.assert_close(square_column.data, square_weight.t())
 
     merged = _instance(
         module._ColumnvLLMParameter,
@@ -224,6 +255,14 @@ def test_nn_layout_loaders_transpose_and_use_physical_dimensions(
     torch.testing.assert_close(qkv.data[:, 2:4], torch.zeros(3, 2, dtype=torch.int64))
 
     full_row = torch.arange(12).reshape(3, 4)
+    base_row = _instance(
+        module.BasevLLMParameter,
+        data=torch.zeros(2, 3, dtype=full_row.dtype),
+        tp_rank=1,
+    )
+    base_row.load_row_parallel_weight(full_row)
+    torch.testing.assert_close(base_row.data, full_row[:, 2:4].t())
+
     row = _instance(
         module.RowvLLMParameter,
         data=torch.zeros(2, 3, dtype=full_row.dtype),

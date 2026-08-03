@@ -73,6 +73,20 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
+def _is_quantization_method(method: QuantizeMethodBase) -> bool:
+    """Class-identity-safe quantization check.
+
+    The HCU module exchange can leave an already-imported vLLM
+    ``UnquantizedLinearMethod`` class alongside the HCU implementation.  An
+    ``isinstance`` check then incorrectly marks an ordinary linear layer as
+    quantized and selects the official (non-NN-layout) weight loader.  The
+    v2 loader selection above already uses the stable class-name contract, so
+    use the same contract here.
+    """
+
+    return method.__class__.__name__ != "UnquantizedLinearMethod"
+
+
 def register_weight_loader_v2_supported_method(cls):
     """Decorator to register a LinearMethod as supporting weight_loader_v2."""
     WEIGHT_LOADER_V2_SUPPORTED.append(cls.__name__)
@@ -402,7 +416,7 @@ class ReplicatedLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
-        self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
+        self.is_quantization = _is_quantization_method(self.quant_method)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         # If the weight on disk does not have a shape, give it one
@@ -558,7 +572,7 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
         self.update_param_tp_status()
-        self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
+        self.is_quantization = _is_quantization_method(self.quant_method)
 
     def _maybe_allow_fp8_block_shape_mismatch(self) -> None:
         quant_config = getattr(self, "quant_config", None)
@@ -732,7 +746,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
-        self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
+        self.is_quantization = _is_quantization_method(self.quant_method)
 
     def validate_shard_id(self, shard_id: Any) -> TypeIs[int | tuple[int, ...] | None]:
         if isinstance(shard_id, int):
@@ -1160,7 +1174,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
-        self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
+        self.is_quantization = _is_quantization_method(self.quant_method)
 
     def validate_shard_id(self, shard_id: Any) -> TypeIs[str | None]:
         if shard_id in {"q", "k", "v"} or shard_id is None:
@@ -1783,7 +1797,7 @@ class RowParallelLinear(LinearBase):
         else:
             self.register_parameter("bias", None)
         self.update_param_tp_status()
-        self.is_quantization = not isinstance(self.quant_method, UnquantizedLinearMethod)
+        self.is_quantization = _is_quantization_method(self.quant_method)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)

@@ -9,6 +9,14 @@ from vllm.utils.torch_utils import direct_register_custom_op
 import vllm_hcu.platforms.envs as henvs
 
 
+# lightop's HCU RMSNorm kernel currently rejects reductions narrower than one
+# wave.  Small Mamba projections (for example Falcon-Mamba's time_step_rank
+# and state_size, both 8 in the tiny model) legitimately use smaller widths.
+# Keep the custom kernel for supported shapes and route only those narrow
+# reductions through vLLM's numerically equivalent implementation.
+_LIGHTOP_RMSNORM_MIN_COLS = 64
+
+
 def _hcu_rmsnorm_forward_autograd_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -67,7 +75,12 @@ class HcuRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if  henvs.VLLM_HCU_USE_CUSTOM_OPS and henvs.VLLM_HCU_USE_CUSTOM_RMS_NORM:
+        use_custom_rms_norm = (
+            henvs.VLLM_HCU_USE_CUSTOM_OPS
+            and henvs.VLLM_HCU_USE_CUSTOM_RMS_NORM
+            and x.shape[-1] >= _LIGHTOP_RMSNORM_MIN_COLS
+        )
+        if use_custom_rms_norm:
             if residual is None:
                 out = torch.ops.vllm.hcu_rmsnorm_forward_autograd(
                     x, self.weight, self.variance_epsilon, self.training
