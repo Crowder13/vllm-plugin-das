@@ -24,7 +24,6 @@ jobs:
       VLLM_HCU_TEST_STRICT_RESOURCES: "1"
       HF_HUB_OFFLINE: "1"
       HF_DATASETS_OFFLINE: "1"
-      HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
 
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +33,7 @@ jobs:
 
       - name: Run multi-node suite
         env:
+          HCU_CI_JOB_ROOT: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
           HCU_CI_JOB_ID: weekly-multi-node
           HCU_CI_ARCH: gfx938
           HCU_CI_CARDS: "8"
@@ -47,6 +47,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.run_id }}-gfx938-8x2-multi-node-${{ github.run_attempt }}
-          path: ${{ env.HCU_CI_JOB_ROOT }}
+          path: ${{ runner.temp }}/vllm-hcu-ci/${{ github.run_id }}-${{ github.run_attempt }}-multi-node
           if-no-files-found: error
           retention-days: 14
