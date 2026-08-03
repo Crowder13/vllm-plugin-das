@@ -644,6 +644,20 @@ def _case_spec_decode_parity(
     }
 
 
+def _case_mtp_parity(model_path: Path) -> dict[str, Any]:
+    baseline = _generate(model_path, enforce_eager=True)
+    speculative = _generate(
+        model_path,
+        enforce_eager=True,
+        spec_method="mtp",
+        spec_tokens=1,
+    )
+    return {
+        "baseline": baseline,
+        "speculative": speculative,
+    }
+
+
 def _case_kv_transfer_smoke(model_path: Path) -> dict[str, Any]:
     from vllm import LLM
     from vllm.config.kv_transfer import KVTransferConfig
@@ -1061,6 +1075,7 @@ def _main(argv: list[str] | None = None) -> int:
             "smoke",
             "graph-parity",
             "lora-switching",
+            "mtp-parity",
             "spec-decode-parity",
             "kv-transfer-smoke",
             "prefix-caching-smoke",
@@ -1098,6 +1113,8 @@ def _main(argv: list[str] | None = None) -> int:
         if args.draft_model is None:
             raise SystemExit("spec-decode-parity requires --draft-model")
         payload = _case_spec_decode_parity(args.model, draft_model=args.draft_model)
+    elif args.case == "mtp-parity":
+        payload = _case_mtp_parity(args.model)
     elif args.case == "kv-transfer-smoke":
         payload = _case_kv_transfer_smoke(args.model)
     elif args.case == "prefix-caching-smoke":

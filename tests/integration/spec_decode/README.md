@@ -4,10 +4,14 @@ Real speculative-decoding tests live here. Contract-only proposer and scheduler
 state tests remain under `runtime_patch/`.
 
 The initial coverage compares greedy output tokens between baseline generation
-and EAGLE speculative decoding with:
+and speculative decoding with:
 
 - target: `vllm-optest-models/TheBloke/Llama-2-7B-fp16`
 - draft: `vllm-optest-models/yuhuili/EAGLE-llama2-chat-7B`
+
+It also compares baseline greedy tokens with the in-checkpoint MTP path of
+`qwen3.5/Qwen3.5-4B`. The MTP test uses `method="mtp"` with one draft token;
+its checkpoint has the required `mtp.layers.*` weights.
 
 The local Qwen2 EAGLE checkpoint resolves to `EagleQwen2ForCausalLM`, which is
 not registered in the current vLLM 0.25 runtime. The local NVIDIA Llama 3.1
@@ -22,6 +26,7 @@ Override paths with:
 
 - `VLLM_HCU_SPEC_TARGET_MODEL`
 - `VLLM_HCU_SPEC_DRAFT_MODEL`
+- `VLLM_HCU_MTP_MODEL`
 
 Run only this coverage with:
 

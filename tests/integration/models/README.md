@@ -20,7 +20,11 @@ Additional model axes use:
   M-RoPE.
 - `qwen3/Qwen3-Embedding-0.6B` for pooling embeddings.
 - `qwen3/Qwen3-Reranker-0.6B` for relevance ordering.
+- `vllm-optest-models/tiiuae/falcon-mamba-tiny-dev` for real Mamba prefill
+  and decode.
 
 Override these paths with `VLLM_HCU_QWEN25_15B_MODEL`,
 `VLLM_HCU_QWEN25_VL_3B_MODEL`, `VLLM_HCU_QWEN3_EMBEDDING_06B_MODEL`, and
 `VLLM_HCU_QWEN3_RERANKER_06B_MODEL`.
+
+The real Mamba path can be overridden through `VLLM_HCU_FALCON_MAMBA_MODEL`.
