@@ -84,6 +84,40 @@ def test_protocol_change_selects_protocol_server_job() -> None:
     assert fallback is False
 
 
+def test_pooling_server_change_selects_pooling_job() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/integration/server/test_qwen3_pooling_server.py"],
+    )
+    assert {job["id"] for job in jobs} == {"qwen3-pooling"}
+    assert "pooling-tests" in groups
+    assert fallback is False
+
+
+def test_protocol_helper_change_selects_all_server_consumers() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["tests/integration/server/openai_server.py"],
+    )
+    assert {job["id"] for job in jobs} == {
+        "qwen25-models",
+        "qwen3-pooling",
+        "qwen3-protocol",
+    }
+    assert "protocol-tests" in groups
+    assert fallback is False
+
+
+def test_mamba_change_selects_real_mamba_smoke() -> None:
+    jobs, groups, fallback = select_jobs(
+        _config(),
+        ["vllm_hcu/model_executor/layers/mamba_runtime.py"],
+    )
+    assert {job["id"] for job in jobs} == {"mamba-smoke"}
+    assert "mamba" in groups
+    assert fallback is False
+
+
 def test_unknown_production_change_uses_conservative_fallback() -> None:
     jobs, groups, fallback = select_jobs(
         _config(),

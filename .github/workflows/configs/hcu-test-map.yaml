@@ -154,9 +154,9 @@
       "suite": "model",
       "pytest_args": [
         "-k",
-        "llama2_7b_eagle_spec_decode_token_parity"
+        "llama2_7b_eagle_spec_decode_token_parity or qwen35_4b_mtp_spec_decode_token_parity"
       ],
-      "timeout_minutes": 90,
+      "timeout_minutes": 120,
       "requirements": [
         {
           "kind": "model",
@@ -167,6 +167,29 @@
           "kind": "model",
           "env": "VLLM_HCU_SPEC_DRAFT_MODEL",
           "relative": "vllm-optest-models/yuhuili/EAGLE-llama2-chat-7B"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_MTP_MODEL",
+          "relative": "qwen3.5/Qwen3.5-4B"
+        }
+      ]
+    },
+    "mamba-smoke": {
+      "runner": "hcu-linux-gfx938-1",
+      "arch": "gfx938",
+      "cards": 1,
+      "suite": "model",
+      "pytest_args": [
+        "-k",
+        "falcon_mamba_tiny_real_prefill_decode_smoke"
+      ],
+      "timeout_minutes": 45,
+      "requirements": [
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_FALCON_MAMBA_MODEL",
+          "relative": "vllm-optest-models/tiiuae/falcon-mamba-tiny-dev"
         }
       ]
     },
@@ -254,7 +277,7 @@
       "suite": "model",
       "pytest_args": [
         "-k",
-        "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke"
+        "qwen3_embedding_06b_hidden_pooling_smoke or qwen3_reranker_06b_relevance_smoke or qwen3_embedding_06b_openai_embeddings_server_smoke or qwen3_reranker_score_and_rerank_server_smoke"
       ],
       "timeout_minutes": 90,
       "requirements": [
@@ -267,6 +290,11 @@
           "kind": "model",
           "env": "VLLM_HCU_QWEN3_RERANKER_06B_MODEL",
           "relative": "qwen3/Qwen3-Reranker-0.6B"
+        },
+        {
+          "kind": "model",
+          "env": "VLLM_HCU_QWEN3_RERANKER_SEQCLS_06B_MODEL",
+          "relative": "vllm-optest-models/tomaarsen/Qwen3-Reranker-0.6B-seq-cls"
         }
       ]
     },
@@ -433,6 +461,16 @@
         "spec-decode"
       ]
     },
+    "mamba": {
+      "patterns": [
+        "vllm_hcu/**mamba*",
+        "vllm_hcu/**causal_conv*",
+        "tests/integration/models/test_falcon_mamba_smoke.py"
+      ],
+      "jobs": [
+        "mamba-smoke"
+      ]
+    },
     "kv-transfer": {
       "patterns": [
         "vllm_hcu/**kv_transfer*",
@@ -483,7 +521,9 @@
       "jobs": [
         "qwen35-smoke",
         "qwen25-models",
-        "qwen3-pooling"
+        "qwen3-pooling",
+        "mamba-smoke",
+        "spec-decode"
       ]
     },
     "qwen25-tests": {
@@ -497,7 +537,8 @@
     },
     "pooling-tests": {
       "patterns": [
-        "tests/integration/models/test_qwen3_pooling_models.py"
+        "tests/integration/models/test_qwen3_pooling_models.py",
+        "tests/integration/server/test_qwen3_pooling_server.py"
       ],
       "jobs": [
         "qwen3-pooling"
@@ -509,7 +550,8 @@
       ],
       "jobs": [
         "qwen3-protocol",
-        "qwen25-models"
+        "qwen25-models",
+        "qwen3-pooling"
       ]
     },
     "qwen3-protocol-tests": {
