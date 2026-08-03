@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -311,6 +312,7 @@ def run_vllm_case(
     model_path: Path,
     *,
     timeout_s: int = 900,
+    gpu_memory_utilization: float | None = None,
     extra_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     log_label: str | None = None,
@@ -319,6 +321,15 @@ def run_vllm_case(
     env.pop("VLLM_PLUGINS", None)
     env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    if gpu_memory_utilization is not None:
+        if not 0.0 < gpu_memory_utilization <= 1.0:
+            raise ValueError(
+                "gpu_memory_utilization must be greater than 0 and at most 1"
+            )
+        env["VLLM_HCU_TEST_GPU_MEMORY_UTILIZATION"] = str(
+            gpu_memory_utilization
+        )
     if extra_env:
         env.update(extra_env)
     log_path = _case_log_path(log_label or case, model_path)
@@ -332,25 +343,39 @@ def run_vllm_case(
     ]
     if extra_args:
         command.extend(extra_args)
-    result = subprocess.run(
-        command,
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout_s,
-        check=False,
-    )
-    _write_case_log(log_path, command, result.stdout, env=env, extra_env=extra_env)
-    if result.returncode != 0:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log:
+        log.write(_case_log_header(command, env=env, extra_env=extra_env))
+        log.flush()
+        proc = subprocess.Popen(
+            command,
+            cwd=Path(__file__).resolve().parents[2],
+            env=env,
+            text=True,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            returncode = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            _terminate_case_process_group(proc)
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            raise AssertionError(
+                f"vLLM integration case {case!r} timed out after {timeout_s}s\n"
+                f"command={' '.join(command)}\n"
+                f"log={log_path}\n"
+                f"{output}"
+            ) from None
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    if returncode != 0:
         raise AssertionError(
-            f"vLLM integration case {case!r} failed with rc={result.returncode}\n"
+            f"vLLM integration case {case!r} failed with rc={returncode}\n"
             f"command={' '.join(command)}\n"
             f"log={log_path}\n"
-            f"{result.stdout}"
+            f"{output}"
         )
-    for line in reversed(result.stdout.splitlines()):
+    for line in reversed(output.splitlines()):
         if line.startswith(RESULT_PREFIX):
             payload = line.removeprefix(RESULT_PREFIX)
             parsed = json.loads(payload)
@@ -360,7 +385,7 @@ def run_vllm_case(
     raise AssertionError(
         f"vLLM integration case {case!r} did not emit {RESULT_PREFIX!r}\n"
         f"log={log_path}\n"
-        f"{result.stdout}"
+        f"{output}"
     )
 
 
@@ -372,23 +397,37 @@ def _case_log_path(case: str, model_path: Path) -> Path:
     return log_dir / f"{timestamp}_{model_name}_{case_name}.log"
 
 
-def _write_case_log(
-    log_path: Path,
+def _case_log_header(
     command: list[str],
-    output: str,
     *,
     env: dict[str, str],
     extra_env: dict[str, str] | None,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+) -> str:
     header = "command: " + " ".join(command) + "\n"
-    env_names = ["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"]
+    env_names = [
+        "VLLM_HCU_USE_FLASH_ATTN_UNIFIED",
+        "VLLM_HCU_TEST_GPU_MEMORY_UTILIZATION",
+    ]
     if extra_env:
         env_names.extend(sorted(extra_env))
     header += "environment: " + " ".join(
         f"{name}={env[name]}" for name in env_names if name in env
     ) + "\n"
-    log_path.write_text(header + output, encoding="utf-8")
+    return header
+
+
+def _terminate_case_process_group(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=30)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        proc.wait(timeout=10)
 
 
 def _llm_kwargs(
@@ -404,7 +443,9 @@ def _llm_kwargs(
         "max_model_len": 512,
         "max_num_batched_tokens": 512,
         "max_num_seqs": 4,
-        "gpu_memory_utilization": 0.35,
+        "gpu_memory_utilization": float(
+            os.environ.get("VLLM_HCU_TEST_GPU_MEMORY_UTILIZATION", "0.35")
+        ),
         "seed": 0,
     }
     kwargs.update(overrides)
