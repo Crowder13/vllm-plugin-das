@@ -40,14 +40,15 @@ Override vLLM memory reservation with:
 
 - `VLLM_HCU_QWEN35_35B_A3B_GPU_MEMORY_UTILIZATION` (common Qwen override)
 - `VLLM_HCU_QWEN35_35B_A3B_TP2_GPU_MEMORY_UTILIZATION` (TP2 override,
-  default: `0.8`)
+  default: `0.4`)
 - `VLLM_HCU_QWEN35_35B_A3B_TP4_GPU_MEMORY_UTILIZATION` (TP4 override,
-  default: `0.8`)
+  default: `0.4`)
 - `VLLM_HCU_DEEPSEEK_R1_CHANNEL_INT8_GPU_MEMORY_UTILIZATION` (default: `0.6`)
 
 The TP-specific Qwen setting takes precedence over the common Qwen setting.
-The Qwen defaults leave enough room for model profiling and KV cache;
-`0.15` leaves no room for KV cache on a 64 GiB device in TP2.
+On a 144 GiB gfx938 device, the Qwen defaults reserve about 57.6 GiB per
+rank and leave enough room for this short smoke test's model profiling and KV
+cache. `0.15` leaves no room for KV cache in TP2.
 
 Run only this coverage with:
 

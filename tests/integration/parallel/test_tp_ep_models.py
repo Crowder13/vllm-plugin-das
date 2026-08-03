@@ -24,8 +24,8 @@ QWEN35_35B_A3B_TP_EP_SIZES = (
     pytest.param(2, id="tp2-ep2"),
 )
 QWEN35_35B_A3B_GPU_MEMORY_UTILIZATION = {
-    2: 0.8,
-    4: 0.8,
+    2: 0.4,
+    4: 0.4,
 }
 QWEN35_35B_A3B_TP_EP_MOE_PATHS = (
     pytest.param(
