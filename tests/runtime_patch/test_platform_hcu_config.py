@@ -362,11 +362,22 @@ def test_cli_omission_preserves_sidecar_and_explicit_flag_overrides() -> None:
 def _make_compilation_module() -> ModuleType:
     module = ModuleType(patch_compilation_config.TARGET_MODULE)
 
+    class _CUDAGraphMode:
+        def __init__(self, piecewise: bool = True) -> None:
+            self.piecewise = piecewise
+
+        def has_piecewise_cudagraphs(self) -> bool:
+            return self.piecewise
+
     class CompilationConfig:
         def __init__(self) -> None:
             self.pass_config = SimpleNamespace(enable_sp=False)
             self.calls = 0
             self.sp_observed = False
+            self.splitting_calls = 0
+            self.splitting_ops = ["vllm::unified_mla_attention_with_output"]
+            self.use_inductor_graph_partition = False
+            self.cudagraph_mode = _CUDAGraphMode()
 
         def adjust_cudagraph_sizes_for_spec_decode(
             self,
@@ -376,6 +387,14 @@ def _make_compilation_module() -> ModuleType:
             self.calls += 1
             self.sp_observed = self.pass_config.enable_sp
             return uniform_decode_query_len, tensor_parallel_size
+
+        def set_splitting_ops_for_v1(
+            self,
+            all2all_backend: str,
+            data_parallel_size: int = 1,
+        ) -> tuple[str, int]:
+            self.splitting_calls += 1
+            return all2all_backend, data_parallel_size
 
     module.CompilationConfig = CompilationConfig
     return module
@@ -404,15 +423,90 @@ def test_compilation_custom_sp_adapter_preserves_feature_off_path() -> None:
     assert config.pass_config.enable_sp is False
 
 
-def test_compilation_adapter_rejects_signature_drift() -> None:
+def test_compilation_adapter_splits_hcu_sparse_indexer_from_piecewise_graph() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+
+    assert config.set_splitting_ops_for_v1("allgather_reducescatter", 8) == (
+        "allgather_reducescatter",
+        8,
+    )
+    assert config.splitting_calls == 1
+    assert config.splitting_ops[-1] == "vllm::hcu_sparse_attn_indexer"
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter", 8)
+    assert config.splitting_ops.count("vllm::hcu_sparse_attn_indexer") == 1
+
+
+def test_compilation_adapter_defers_to_inductor_unsafe_tags() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.use_inductor_graph_partition = True
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter")
+    assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+
+
+def test_compilation_adapter_skips_non_piecewise_cudagraphs() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.cudagraph_mode.piecewise = False
+
+    config.set_splitting_ops_for_v1("allgather_reducescatter")
+    assert "vllm::hcu_sparse_attn_indexer" not in config.splitting_ops
+
+
+def test_compilation_adapter_requires_finalized_splitting_ops_list() -> None:
+    module = _make_compilation_module()
+    patch_compilation_config.apply_to_module(module)
+    config = module.CompilationConfig()
+    config.splitting_ops = None
+
+    with pytest.raises(PatchCompatibilityError, match="finalized as a list"):
+        config.set_splitting_ops_for_v1("allgather_reducescatter")
+
+
+def test_compilation_adapter_rejects_adjust_signature_drift() -> None:
     module = ModuleType(patch_compilation_config.TARGET_MODULE)
 
     class CompilationConfig:
         def adjust_cudagraph_sizes_for_spec_decode(self, query_len: int) -> None:
             pass
 
+        def set_splitting_ops_for_v1(
+            self,
+            all2all_backend: str,
+            data_parallel_size: int = 1,
+        ) -> None:
+            pass
+
     module.CompilationConfig = CompilationConfig
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
+        patch_compilation_config.apply_to_module(module)
+
+
+def test_compilation_adapter_rejects_splitting_signature_drift() -> None:
+    module = ModuleType(patch_compilation_config.TARGET_MODULE)
+
+    class CompilationConfig:
+        def adjust_cudagraph_sizes_for_spec_decode(
+            self,
+            uniform_decode_query_len: int,
+            tensor_parallel_size: int,
+        ) -> None:
+            pass
+
+        def set_splitting_ops_for_v1(self, all2all_backend: str) -> None:
+            pass
+
+    module.CompilationConfig = CompilationConfig
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="set_splitting_ops_for_v1.*incompatible signature",
+    ):
         patch_compilation_config.apply_to_module(module)
 
 

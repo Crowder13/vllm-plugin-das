@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Custom-SP cudagraph alignment without extending CompilationConfig."""
+"""HCU CUDAGraph alignment without extending CompilationConfig."""
 
 from __future__ import annotations
 
@@ -16,11 +16,15 @@ from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
 from ._common import PatchCompatibilityError, apply_once, load_exact_module
 
 TARGET_MODULE = "vllm.config.compilation"
-PATCH_ID = "platform.core_fix.hcu_config.compilation_custom_sp"
+PATCH_ID = "platform.core_fix.hcu_config.compilation_cudagraph"
 TARGETS = (
     f"{TARGET_MODULE}.CompilationConfig.adjust_cudagraph_sizes_for_spec_decode",
+    f"{TARGET_MODULE}.CompilationConfig.set_splitting_ops_for_v1",
 )
-_MARKER = "_vllm_hcu_custom_sp_cudagraph_patch_applied"
+_MARKER = "_vllm_hcu_compilation_cudagraph_patch_applied"
+_HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS = (
+    "vllm::hcu_sparse_attn_indexer",
+)
 _BOUND_CONFIGS_LOCK = threading.RLock()
 _BOUND_CONFIGS: dict[
     int,
@@ -89,9 +93,12 @@ def apply_to_module(module: ModuleType) -> bool:
     original = vars(compilation_config).get(
         "adjust_cudagraph_sizes_for_spec_decode"
     )
-    if not callable(original):
+    original_set_splitting_ops = vars(compilation_config).get(
+        "set_splitting_ops_for_v1"
+    )
+    if not callable(original) or not callable(original_set_splitting_ops):
         raise PatchCompatibilityError(
-            f"required HCU patch target {TARGETS[0]} is missing"
+            "required HCU CompilationConfig compatibility methods are missing"
         )
     signature = inspect.signature(original)
     if tuple(signature.parameters) != (
@@ -102,6 +109,17 @@ def apply_to_module(module: ModuleType) -> bool:
         raise PatchCompatibilityError(
             f"required HCU patch target {TARGETS[0]} has incompatible "
             f"signature {signature}"
+        )
+
+    splitting_signature = inspect.signature(original_set_splitting_ops)
+    if tuple(splitting_signature.parameters) != (
+        "self",
+        "all2all_backend",
+        "data_parallel_size",
+    ):
+        raise PatchCompatibilityError(
+            f"required HCU patch target {TARGETS[1]} has incompatible "
+            f"signature {splitting_signature}"
         )
 
     @functools.wraps(original)
@@ -137,6 +155,42 @@ def apply_to_module(module: ModuleType) -> bool:
         finally:
             pass_config.enable_sp = False
 
+    @functools.wraps(original_set_splitting_ops)
+    def hcu_set_splitting_ops_for_v1(
+        self,
+        all2all_backend: str,
+        data_parallel_size: int = 1,
+    ):
+        result = original_set_splitting_ops(
+            self,
+            all2all_backend,
+            data_parallel_size,
+        )
+        # With Inductor graph partitioning enabled, the operator's
+        # ``cudagraph_unsafe`` tag is authoritative. HCU currently uses the
+        # legacy Dynamo splitting path, so target vLLM's manually maintained
+        # splitting list must also contain every HCU-only unsafe operator.
+        # GLM DSA reaches this path through ``hcu_sparse_attn_indexer`` during
+        # piecewise capture, so the HCU registration is part of its contract.
+        if getattr(self, "use_inductor_graph_partition", False):
+            return result
+
+        cudagraph_mode = getattr(self, "cudagraph_mode", None)
+        has_piecewise = getattr(cudagraph_mode, "has_piecewise_cudagraphs", None)
+        if not callable(has_piecewise) or not has_piecewise():
+            return result
+
+        splitting_ops = getattr(self, "splitting_ops", None)
+        if not isinstance(splitting_ops, list):
+            raise PatchCompatibilityError(
+                "CompilationConfig.splitting_ops must be finalized as a list "
+                "before HCU unsafe operators are registered"
+            )
+        for op_name in _HCU_CUDAGRAPH_UNSAFE_SPLITTING_OPS:
+            if op_name not in splitting_ops:
+                splitting_ops.append(op_name)
+        return result
+
     setattr(
         compilation_config,
         "_vllm_hcu_original_adjust_cudagraph_sizes_for_spec_decode",
@@ -146,6 +200,16 @@ def apply_to_module(module: ModuleType) -> bool:
         compilation_config,
         "adjust_cudagraph_sizes_for_spec_decode",
         hcu_adjust_cudagraph_sizes,
+    )
+    setattr(
+        compilation_config,
+        "_vllm_hcu_original_set_splitting_ops_for_v1",
+        original_set_splitting_ops,
+    )
+    setattr(
+        compilation_config,
+        "set_splitting_ops_for_v1",
+        hcu_set_splitting_ops_for_v1,
     )
     setattr(compilation_config, _MARKER, True)
     return True

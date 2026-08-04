@@ -62,7 +62,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
         ("platform.core_fix.envs", "vllm.envs"),
         ("platform.core_fix.import_utils.deep_gemm", "vllm.utils.import_utils"),
         ("platform.core_fix.hcu_config.engine_args", "vllm.engine.arg_utils"),
-        ("platform.core_fix.hcu_config.compilation_custom_sp", "vllm.config.compilation"),
+        (
+            "platform.core_fix.hcu_config.compilation_cudagraph",
+            "vllm.config.compilation",
+        ),
         ("platform.core_fix.hcu_config.vllm", "vllm.config.vllm"),
         (
             "platform.core_fix.hcu_config.slimquant_registry",

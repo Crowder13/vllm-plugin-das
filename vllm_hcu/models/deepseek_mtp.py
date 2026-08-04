@@ -9,10 +9,15 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from vllm.forward_context import get_forward_context
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -28,13 +33,13 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
-from vllm.distributed import (
-    tensor_model_parallel_all_gather, 
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size
-)
+
+import vllm_hcu.platforms.envs as henvs
+from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
@@ -43,11 +48,6 @@ from .deepseek_v2 import (
     _try_load_quantized_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
-from vllm.model_executor.models.interfaces import SupportsPP
-from vllm.model_executor.models.utils import maybe_prefix
-
-import vllm_hcu.platforms.envs as henvs
-from vllm_hcu.v1.attention.lightly_cp_utils import lightly_cp_inputs_splitting
 
 logger = init_logger(__name__)
 
@@ -115,7 +115,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_index: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert inputs_embeds is not None
         # masking inputs at position 0, as not needed by MTP
         inputs_embeds = torch.where(positions.unsqueeze(-1) == 0, 0, inputs_embeds)
@@ -129,8 +129,11 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = residual + hidden_states
-        return hidden_states
+        hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+        # Target vLLM's DeepSeek MTP proposer recycles the post-final-norm
+        # hidden state into the next draft step, while compute_logits applies
+        # shared_head to the pre-norm element.
+        return hidden_states, self.shared_head(hidden_states)
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
@@ -158,20 +161,31 @@ class DeepSeekMultiTokenPredictor(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        
+
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def set_skip_topk(self, skip: bool):
-        """Toggle skip_topk on all MTP layers with sparse attention."""
+    def _iter_mla_attn(self) -> Iterable[object]:
         for layer in self.layers.values():
             mtp_block = getattr(layer, "mtp_block", None)
-            if mtp_block is not None:
-                self_attn = getattr(mtp_block, "self_attn", None)
-                if self_attn is not None:
-                    mla_attn = getattr(self_attn, "mla_attn", None)
-                    if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
-                        mla_attn.skip_topk = skip
+            self_attn = getattr(mtp_block, "self_attn", None)
+            mla_attn = getattr(self_attn, "mla_attn", None)
+            if mla_attn is not None:
+                yield mla_attn
+
+    def set_skip_topk(self, skip: bool) -> None:
+        """Toggle skip_topk on all MTP layers with sparse attention."""
+        for mla_attn in self._iter_mla_attn():
+            if hasattr(mla_attn, "skip_topk"):
+                mla_attn.skip_topk = skip
+
+    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
+        """Compact per-token index rows for subsequent MTP draft steps."""
+        num_slots = slot_ids.numel()
+        for mla_attn in self._iter_mla_attn():
+            if hasattr(mla_attn, "topk_indices_buffer"):
+                topk_indices_buffer = mla_attn.topk_indices_buffer
+                topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -183,36 +197,51 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         previous_hidden_states: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
-        
+
         enable_lightly_cp = get_forward_context().enable_lightly_cp
         if enable_lightly_cp:
-            previous_hidden_states, positions, _, inputs_embeds = \
-                lightly_cp_inputs_splitting(previous_hidden_states,
-                                            positions,
-                                            None,
-                                            inputs_embeds,
-                                            self.tp_size,
-                                            self.tp_rank)
-                
-        hidden_states =  self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
+            previous_hidden_states, positions, _, inputs_embeds = (
+                lightly_cp_inputs_splitting(
+                    previous_hidden_states,
+                    positions,
+                    None,
+                    inputs_embeds,
+                    self.tp_size,
+                    self.tp_rank,
+                )
+            )
+
+        last_hidden_states, hidden_states = self.layers[
+            str(self.mtp_start_layer_idx + current_step_idx)
+        ](
             input_ids,
             positions,
             previous_hidden_states,
             inputs_embeds,
             current_step_idx,
         )
-        
+
         if enable_lightly_cp:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states.contiguous(), dim=0)
+            last_hidden_states = tensor_model_parallel_all_gather(
+                last_hidden_states.contiguous(), dim=0
+            )
+            hidden_states = tensor_model_parallel_all_gather(
+                hidden_states.contiguous(), dim=0
+            )
             gather_indexes_tensor = get_forward_context().gather_indexes_tensor
             if gather_indexes_tensor is not None:
-                hidden_states = torch.index_select(hidden_states, 0, gather_indexes_tensor)
+                hidden_states = torch.index_select(
+                    hidden_states, 0, gather_indexes_tensor
+                )
+                last_hidden_states = torch.index_select(
+                    last_hidden_states, 0, gather_indexes_tensor
+                )
 
-        return hidden_states
+        return last_hidden_states, hidden_states
 
     def compute_logits(
         self,
@@ -269,7 +298,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
