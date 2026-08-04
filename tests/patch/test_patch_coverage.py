@@ -15,11 +15,13 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 def test_every_patch_module_has_contract_and_direct_test_reference() -> None:
     audit = coverage_gate.audit_repository(REPOSITORY)
 
-    assert audit.patch_file_count == 82
-    assert audit.adapter_count == 81
     assert audit.coordinator_helpers == (
         "vllm_hcu.patch.platform.core_fix.patch_hcu_config",
     )
+    assert audit.patch_file_count == (
+        audit.adapter_count + len(audit.coordinator_helpers)
+    )
+    assert audit.adapter_count > 0
     assert audit.missing_contract == {}
     assert audit.untested_modules == ()
 

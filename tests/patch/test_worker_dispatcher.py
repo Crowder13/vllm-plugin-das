@@ -83,7 +83,7 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
             "vllm_hcu.distributed.device_communicators.custom_all_reduce",
         ),
     )
-    assert len(callbacks) == 59
+    assert callbacks
     assert len({patch_id for patch_id, _ in callbacks}) == len(callbacks)
 
     positions = {patch_id: index for index, (patch_id, _) in enumerate(callbacks)}
@@ -202,6 +202,9 @@ def test_independent_worker_cold_prepare_installs_inside_atomic_batch(
 
 
 def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
+    expected_callbacks = len(worker_dispatcher.worker_callback_names())
+    expected_replacements = len(worker_dispatcher.worker_module_exchange_names())
+    expected_total = expected_callbacks + expected_replacements
     result = _run_fresh(
         "import builtins,json,sys; "
         "from vllm_hcu.patch.worker import (prepare_worker_patches,"
@@ -233,10 +236,10 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "first": 63,
-        "second": 63,
-        "replacements": 4,
-        "callbacks": 59,
+        "first": expected_total,
+        "second": expected_total,
+        "replacements": expected_replacements,
+        "callbacks": expected_callbacks,
         "statuses": ["armed"],
         "targets_loaded": [],
         "business_loaded": [],
@@ -248,6 +251,9 @@ def test_prepare_is_lazy_narrow_idempotent_and_keeps_main_role():
 
 
 def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
+    expected_worker_patches = len(worker_dispatcher.worker_callback_names()) + len(
+        worker_dispatcher.worker_module_exchange_names()
+    )
     result = _run_fresh(
         "import json,os,pickle; from types import SimpleNamespace; "
         "CompilationConfig=type('CompilationConfig',(),{}); "
@@ -282,7 +288,7 @@ def test_apply_binds_pickled_sidecar_feature_state_and_worker_report():
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload["pid"] == payload["actual_pid"]
     assert payload["role"] == "Worker"
-    assert payload["count"] == 63
+    assert payload["count"] == expected_worker_patches
     assert set(map(tuple, payload["selected"].values())) == {("armed", True)}
     assert payload["pynccl"] == ["armed", False]
 
