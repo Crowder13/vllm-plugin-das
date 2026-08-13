@@ -1,0 +1,9 @@
+.git
+.github
+docker
+tests
+docs
+examples
+tools
+__pycache__
+*.pyc
