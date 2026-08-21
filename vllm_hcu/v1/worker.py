@@ -23,6 +23,27 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
+def _create_model_runner(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    *,
+    use_v2_model_runner: bool,
+):
+    if use_v2_model_runner:
+        from vllm_hcu.v1.hcu_model_runner_v2 import (
+            HcuGPUModelRunnerV2,
+            install_fixed_width_pp_sample_broadcast,
+        )
+
+        runner = HcuGPUModelRunnerV2(vllm_config, device)
+        install_fixed_width_pp_sample_broadcast(runner)
+        return runner
+
+    from vllm_hcu.v1.hcu_model_runner import GPUModelRunner
+
+    return GPUModelRunner(vllm_config, device)
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -59,7 +80,21 @@ class HcuGPUWorker(Worker):
         from vllm_hcu.patch.worker import validate_worker_patches
 
         validate_worker_patches(require_applied=True)
-    
+
+    def compile_or_warm_up_model(self):
+        if (
+            self.use_v2_model_runner
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.vllm_config.speculative_config is not None
+        ):
+            from vllm_hcu.v1.worker_framework_runtime import (
+                suppress_pp_v2_warmup_sample_broadcast,
+            )
+
+            with suppress_pp_v2_warmup_sample_broadcast(self.model_runner):
+                return super().compile_or_warm_up_model()
+        return super().compile_or_warm_up_model()
+
     def init_device(self):
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -104,6 +139,14 @@ class HcuGPUWorker(Worker):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            from vllm import envs
+
+            if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:
+                from vllm_hcu.v1.worker_framework_runtime import (
+                    install_split_group_backend_compat,
+                )
+
+                install_split_group_backend_compat(torch.distributed)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -137,21 +180,11 @@ class HcuGPUWorker(Worker):
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
-        if self.use_v2_model_runner:
-            from vllm.v1.worker.gpu.model_runner import (
-                GPUModelRunner as GPUModelRunnerV2,
-            )
-
-            # HACK(woosuk): This is a temporary fix to avoid type errors.
-            self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
-                self.vllm_config, self.device
-            )
-        else:
-            from vllm_hcu.v1.hcu_model_runner import (
-                GPUModelRunner as GPUModelRunnerV1,
-            )
-
-            self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        self.model_runner: GPUModelRunner = _create_model_runner(  # type: ignore
+            self.vllm_config,
+            self.device,
+            use_v2_model_runner=self.use_v2_model_runner,
+        )
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

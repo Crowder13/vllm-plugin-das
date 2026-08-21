@@ -101,15 +101,35 @@ def _is_hcu_aiter_w8a8_moe_requested() -> bool:
 def get_w8a8_int8_marlin_weights(
          weight,
          k_tile=64):
-    # 7168, 512
-    weight = weight.T
-    size_k, size_n = weight.shape
-    assert size_k // k_tile
-    weight = weight.reshape(size_k // k_tile, k_tile, size_n)
-    weight = weight.transpose(1, 2)
-    weight = weight.reshape(size_k // k_tile, size_n * k_tile)
+    if weight.dim() == 2:
+        # [N, K] -> [K // k_tile, N * k_tile]
+        weight = weight.T
+        size_k, size_n = weight.shape
+        assert size_k % k_tile == 0, (
+            "Marlin W8A8 MoE weight K dimension must be divisible by "
+            f"{k_tile}, got {size_k}."
+        )
+        weight = weight.reshape(size_k // k_tile, k_tile, size_n)
+        weight = weight.transpose(1, 2)
+        return weight.reshape(size_k // k_tile, size_n * k_tile)
 
-    return weight
+    if weight.dim() == 3:
+        # [E, N, K] -> [E, K // k_tile, N * k_tile]
+        num_experts, size_n, size_k = weight.shape
+        assert size_k % k_tile == 0, (
+            "Marlin W8A8 MoE weight K dimension must be divisible by "
+            f"{k_tile}, got {size_k}."
+        )
+        weight = weight.transpose(1, 2)
+        weight = weight.reshape(
+            num_experts, size_k // k_tile, k_tile, size_n
+        )
+        weight = weight.transpose(2, 3)
+        return weight.reshape(
+            num_experts, size_k // k_tile, size_n * k_tile
+        )
+
+    raise ValueError(f"Expected 2D or 3D weight, got {weight.dim()}D")
 
 
 def w8a8_nt_kpack2_marlin_weight(w8a8_w, # [size_n, size_k// 2 ]
@@ -297,20 +317,10 @@ class CompressedTensorsW8A8FP8MarlinMoEMethod(CompressedTensorsMarlinMoEMethod):
             layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
             return
 
-        w1_marlin_list = []
-        for ii in range(layer.w13_weight.shape[0]):
-            w1_marlin_in = get_w8a8_int8_marlin_weights(layer.w13_weight[ii])
-            w1_marlin_list.append(w1_marlin_in.float() if w1_marlin_in.dtype == torch.float8_e4m3fn else w1_marlin_in)
-        w1_marlin = torch.stack(w1_marlin_list, dim=0)
-        w1_marlin = fp32_to_fp8_e4m3fn(w1_marlin)
-
-        del w1_marlin_list
-        w2_marlin_list = []
-        for ii in range(layer.w2_weight.shape[0]):
-            w2_marlin_in = get_w8a8_int8_marlin_weights(layer.w2_weight[ii])
-            w2_marlin_list.append(w2_marlin_in.float() if w2_marlin_in.dtype == torch.float8_e4m3fn else w2_marlin_in)
-        w2_marlin = torch.stack(w2_marlin_list, dim=0)
-        w2_marlin = fp32_to_fp8_e4m3fn(w2_marlin)
+        # Repack the full [E, N, K] FP8 tensors in one view/transpose path.
+        # This avoids both FP32 widening and per-expert stack temporaries.
+        w1_marlin = get_w8a8_int8_marlin_weights(layer.w13_weight)
+        w2_marlin = get_w8a8_int8_marlin_weights(layer.w2_weight)
         layer.w13_weight = Parameter(w1_marlin, requires_grad=False)
         layer.w2_weight = Parameter(w2_marlin, requires_grad=False)
 
