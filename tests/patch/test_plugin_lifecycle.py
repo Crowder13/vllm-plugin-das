@@ -72,7 +72,10 @@ def _fresh_python(
     env["VLLM_PLUGINS"] = plugins
     env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
-    if not assert_target_source:
+    if no_site or not assert_target_source:
+        # The dependency-light plugin probe intentionally runs without
+        # site-packages; importing vLLM for the source assertion would require
+        # torch and invalidate the probe itself.
         child_code = code
     elif assert_target_first:
         child_code = _TARGET_SOURCE_ASSERTION + code
@@ -380,7 +383,7 @@ def test_arg_utils_first_import_applies_sidecar_before_first_construction():
         "model_dir=tempfile.TemporaryDirectory(); "
         "Path(model_dir.name,'config.json').write_text('{}'); "
         "args=arg_utils.EngineArgs(model=model_dir.name,enable_custom_sp=True,"
-        "enable_multi_layers_mtp=True,moe_backend='dpsk_deep_gemm'); "
+        "enable_multi_layers_mtp=True,moe_backend='deep_gemm'); "
         "feature=get_hcu_config(args); "
         "record=patch_report()['patches']["
         "'platform.core_fix.hcu_config.engine_args']; "
@@ -400,10 +403,10 @@ def test_arg_utils_first_import_applies_sidecar_before_first_construction():
         "marker": True,
         "status": "applied",
         "dataclass_restored": True,
-        "upstream_backend": "auto",
+        "upstream_backend": "deep_gemm",
         "custom_sp": True,
         "multi_mtp": True,
-        "hcu_backend": "dpsk_deep_gemm",
+        "hcu_backend": "deep_gemm",
     }
 
 

@@ -78,6 +78,12 @@ def _distribution_location(
 def inspect_vllm_compatibility() -> VllmCompatibility:
     """Inspect the installed vLLM metadata without importing vLLM itself."""
 
+    # Keep platform-plugin discovery importable under ``python -S``.  The
+    # platform probe latches a missing runtime dependency before any patch
+    # mutation, while normal compatibility checks still use packaging's full
+    # PEP 440 parser.
+    from packaging.version import InvalidVersion, Version
+
     expected_series = _supported_series()
     hcu_location = str(Path(__file__).resolve().parent)
     try:
@@ -95,8 +101,6 @@ def inspect_vllm_compatibility() -> VllmCompatibility:
 
     actual = distribution.version
     location = _distribution_location(distribution)
-    from packaging.version import InvalidVersion, Version
-
     try:
         parsed = Version(actual)
     except (InvalidVersion, TypeError) as exc:
