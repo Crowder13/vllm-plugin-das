@@ -39,7 +39,7 @@ jobs:
       - name: 安装 CItest
         run: |
           PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install citest[evalscope] \
+          pip install citest[evalscope] cinotificate \
             -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
             --trusted-host "${PYPI_HOST}"
 
@@ -49,6 +49,18 @@ jobs:
                  --case_conf docker/image-citest-conf-hcu.yaml \
                  --models_path /models \
                  --output_dir "${GITHUB_WORKSPACE}/citest-output"
+
+      - name: 飞书通知
+        run: |
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key docker_image_name \
+                       --json_value "${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:${{ env.VLLM_VERSION }}-latest"
+          CInotificate --modify_json "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --json_key jenkins_url \
+                       --json_value "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          CInotificate --notificate_conf "${GITHUB_WORKSPACE}/citest-output/notificate.json" \
+                       --notificate_type PrecisionTest \
+                       --group_name "框架发版对接 高性能推理加速部"
 
       - name: 归档测试结果
         if: always()
