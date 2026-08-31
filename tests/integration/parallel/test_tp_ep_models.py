@@ -34,31 +34,20 @@ QWEN35_35B_A3B_GPU_MEMORY_UTILIZATION = {
 }
 QWEN35_35B_A3B_TP_EP_MOE_PATHS = (
     pytest.param(
-        "aiter-tuned-shuffle",
+        "aiter-auto-shuffle",
         "aiter",
         {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "1",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "1",
+            "VLLM_HCU_USE_AITER_MOE_SHUFFLE": "1",
         },
-        id="aiter-tuned-shuffle",
+        id="aiter-auto-shuffle",
     ),
     pytest.param(
-        "aiter-asm-shuffle",
+        "aiter-auto-nonshuffle",
         "aiter",
         {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "0",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "1",
+            "VLLM_HCU_USE_AITER_MOE_SHUFFLE": "0",
         },
-        id="aiter-asm-shuffle",
-    ),
-    pytest.param(
-        "aiter-asm-nonshuffle",
-        "aiter",
-        {
-            "VLLM_HCU_USE_AITER_MOE_CONFIG": "0",
-            "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE": "0",
-        },
-        id="aiter-asm-nonshuffle",
+        id="aiter-auto-nonshuffle",
     ),
     pytest.param(
         "triton",
@@ -145,7 +134,8 @@ def _assert_tp_ep_result(
     if parallel_config:
         assert parallel_config["tensor_parallel_size"] == expected_tp
         assert parallel_config["data_parallel_size"] == expected_dp
-        assert parallel_config["all2all_backend"] == expected_all2all
+        if expected_all2all is not None:
+            assert parallel_config["all2all_backend"] == expected_all2all
         assert parallel_config["enable_expert_parallel"] is True
         assert parallel_config["world_size"] >= expected_tp
     assert len(result["output"]) == 2

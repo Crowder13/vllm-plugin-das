@@ -19,6 +19,14 @@ from typing import Any
 
 import torch
 
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    execute_aiter_moe,
+    prepare_aiter_moe_weights,
+    resolve_aiter_expert_maps,
+    select_aiter_moe_config,
+)
+
 
 class HcuAiterRuntimeError(RuntimeError):
     """An explicitly requested HCU AITER path cannot be provided."""
@@ -41,8 +49,8 @@ def aiter_gate_mode_kwargs(
     return {"gate_mode": gate_mode}
 
 
-_EXPLICIT_AITER_MOE: ContextVar[bool] = ContextVar(
-    "vllm_hcu_explicit_aiter_moe", default=False
+_EXPLICIT_MOE_BACKEND: ContextVar[str | None] = ContextVar(
+    "vllm_hcu_explicit_moe_backend", default=None
 )
 _AITER_MOE_GLOBAL_NUM_EXPERTS: ContextVar[int | None] = ContextVar(
     "vllm_hcu_aiter_moe_global_num_experts", default=None
@@ -225,25 +233,46 @@ def aiter_asm_boltops_fp8_quant_context(enabled: bool):
         _AITER_ASM_BOLTOPS_FP8_QUANT.reset(token)
 
 
-def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
-    """Keep explicit ``moe_backend=aiter`` independent of auto env gates."""
+def _explicit_moe_backend(moe_config: object | None = None) -> str | None:
+    """Return the highest-priority non-auto MoE backend selection."""
 
-    if getattr(moe_config, "moe_backend", None) == "aiter":
-        return True
-    if _EXPLICIT_AITER_MOE.get():
-        return True
+    backend = getattr(moe_config, "moe_backend", None)
+    if backend not in (None, "auto"):
+        return str(backend)
+
+    backend = _EXPLICIT_MOE_BACKEND.get()
+    if backend not in (None, "auto"):
+        return str(backend)
+
     try:
         from vllm.config import get_current_vllm_config_or_none
 
         config = get_current_vllm_config_or_none()
-        if (
-            config is not None
-            and getattr(getattr(config, "kernel_config", None), "moe_backend", None)
-            == "aiter"
-        ):
-            return True
+        backend = getattr(
+            getattr(config, "kernel_config", None), "moe_backend", None
+        )
+        if backend not in (None, "auto"):
+            return str(backend)
     except (AttributeError, ImportError):
         pass
+    return None
+
+
+def is_aiter_moe_explicitly_disabled(
+    moe_config: object | None = None,
+) -> bool:
+    """Whether an explicit backend requires bypassing every AITER MoE path."""
+
+    backend = _explicit_moe_backend(moe_config)
+    return backend is not None and backend != "aiter"
+
+
+def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
+    """Resolve explicit backend selection before legacy auto env gates."""
+
+    backend = _explicit_moe_backend(moe_config)
+    if backend is not None:
+        return backend == "aiter"
 
     import vllm.envs as envs
 
@@ -254,8 +283,8 @@ def is_aiter_moe_requested(moe_config: object | None = None) -> bool:
 
 @contextmanager
 def aiter_moe_request_context(moe_config: object):
-    request_token = _EXPLICIT_AITER_MOE.set(
-        getattr(moe_config, "moe_backend", None) == "aiter"
+    request_token = _EXPLICIT_MOE_BACKEND.set(
+        getattr(moe_config, "moe_backend", None)
     )
     global_num_experts = getattr(moe_config, "num_experts", None)
     if not isinstance(global_num_experts, int) or global_num_experts <= 0:
@@ -265,7 +294,7 @@ def aiter_moe_request_context(moe_config: object):
         yield
     finally:
         _AITER_MOE_GLOBAL_NUM_EXPERTS.reset(experts_token)
-        _EXPLICIT_AITER_MOE.reset(request_token)
+        _EXPLICIT_MOE_BACKEND.reset(request_token)
 
 
 def _import_optional_aiter_module(module_name: str) -> object | None:
@@ -612,93 +641,15 @@ def _activation_name(activation_method: int) -> str:
         return {
             0: "silu",
             1: "gelu",
-            2: "swiglu",
+            # vLLM maps MoEActivation.SWIGLUOAI to AITER's numeric
+            # ActivationType.Swiglu (2).  The public AITER MoE API uses the
+            # semantic spelling below to retain interleaved OAI SwiGLU math.
+            2: "swigluoai",
             3: "gelu_tanh",
         }[activation_method]
     except KeyError as exc:
         raise HcuAiterRuntimeError(
             f"HCU AITER MoE received unsupported activation_method={activation_method}"
-        ) from exc
-
-
-@functools.cache
-def get_w16a16_moe_config(
-    M: int,
-    E: int,
-    N1: int,
-    N2: int,
-    K: int,
-    top_k: int,
-    dtype: torch.dtype,
-    activation: str,
-    use_shuffle: int,
-) -> object:
-    try:
-        from aiter.moe import MoeQuantType, MoeSolutionType, get_aiter_moe_config
-    except Exception as exc:
-        raise HcuAiterRuntimeError(
-            "HCU AITER W16A16 ASM MoE configuration was requested, but "
-            "aiter.moe.get_aiter_moe_config is unavailable"
-        ) from exc
-
-    status, moe_config = get_aiter_moe_config(
-        M=M,
-        E=E,
-        N1=N1,
-        N2=N2,
-        K=K,
-        top_k=top_k,
-        block_size=0,
-        dtype=dtype,
-        quant_type=MoeQuantType.W16A16,
-        activation=activation,
-        spec_sol_type=MoeSolutionType.ASM,
-        use_shuffle=use_shuffle,
-    )
-    if (
-        not status
-        or moe_config is None
-        or moe_config.solution_type != MoeSolutionType.ASM
-    ):
-        raise HcuAiterRuntimeError(
-            "AITER W16A16 MoE did not find an ASM solution for "
-            f"M={M}, E={E}, N1={N1}, N2={N2}, K={K}, top_k={top_k}, "
-            f"dtype={dtype}, activation={activation}, use_shuffle={use_shuffle}"
-        )
-    return moe_config
-
-
-@functools.cache
-def get_w16a16_moe_solution_id(
-    M: int,
-    E: int,
-    N1: int,
-    N2: int,
-    K: int,
-    top_k: int,
-    dtype: torch.dtype,
-    activation: str,
-    use_shuffle: int,
-) -> str:
-    moe_config = get_w16a16_moe_config(
-        M,
-        E,
-        N1,
-        N2,
-        K,
-        top_k,
-        dtype,
-        activation,
-        use_shuffle,
-    )
-
-    config = getattr(moe_config, "config", None) or {}
-    try:
-        return f"{config['SOL_ID1']}+{config['SOL_ID2']}"
-    except KeyError as exc:
-        raise HcuAiterRuntimeError(
-            "AITER W16A16 ASM configuration is missing SOL_ID1/SOL_ID2: "
-            f"{config}"
         ) from exc
 
 
@@ -787,11 +738,11 @@ def fused_moe_impl(
     moe_sorting_dispatch_policy: int = 0,
     swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
-    """Select HCU's W16A16 ASM path, otherwise preserve upstream exactly."""
+    """Route unquantized HCU MoE through AITER, otherwise preserve upstream."""
 
     from aiter import QuantType
 
-    use_w16a16_asm = (
+    use_w16a16_aiter = (
         is_aiter_moe_requested()
         and QuantType(quant_method) == QuantType.No
         and w1_scale is None
@@ -799,7 +750,7 @@ def fused_moe_impl(
         and a1_scale is None
         and a2_scale is None
     )
-    if not use_w16a16_asm:
+    if not use_w16a16_aiter:
         if activation_method != 3:
             return original(
                 hidden_states,
@@ -870,7 +821,7 @@ def fused_moe_impl(
     from vllm_hcu.platforms import envs as henvs
 
     activation = _activation_name(activation_method)
-    use_shuffle = int(bool(henvs.VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE))
+    use_shuffle = bool(henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE)
     global_num_experts, expert_mask = _aiter_asm_expert_mask_contract(
         expert_mask,
         int(w1.shape[0]),
@@ -901,8 +852,8 @@ def fused_moe_impl(
             f"{moe_sorting_dispatch_policy}"
         )
 
-    # HCU AITER uses w1=[E, 2N, K] and w2=[E, K, N]. Its N2
-    # configuration argument is GEMM2's output dimension, i.e. w2.shape[1].
+    # HCU AITER consumes vLLM's canonical w1=[E, N1, K] and
+    # w2=[E, N2, K2]. N2 is GEMM2's hidden/output dimension at w2.shape[1].
     if (
         w1.dim() != 3
         or w2.dim() != 3
@@ -915,42 +866,85 @@ def fused_moe_impl(
             f"w2.shape={tuple(w2.shape)}"
         )
 
-    direct_kwargs: dict[str, object] = {
-        "activation": activation,
-        "global_num_experts": global_num_experts,
-        "expert_map": expert_mask,
-        "use_shuffle": use_shuffle,
-    }
-    if swiglu_limit:
-        direct_kwargs["gemm1_limit"] = swiglu_limit
-    if bool(henvs.VLLM_HCU_USE_AITER_MOE_CONFIG):
-        direct_kwargs["solution_id"] = get_w16a16_moe_solution_id(
-            M=int(hidden_states.shape[0]),
-            E=global_num_experts,
-            N1=int(w1.shape[1]),
-            N2=int(w2.shape[1]),
-            K=int(w1.shape[2]),
-            top_k=int(topk_ids.shape[1]),
-            dtype=hidden_states.dtype,
-            activation=activation,
-            use_shuffle=use_shuffle,
+    problem = AiterMoeProblem(
+        M=int(hidden_states.shape[0]),
+        E=global_num_experts,
+        N1=int(w1.shape[1]),
+        N2=int(w2.shape[1]),
+        K=int(w1.shape[2]),
+        top_k=int(topk_ids.shape[1]),
+        block_size=0,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+        quant_type="w16a16",
+        activation=activation,
+        use_shuffle=use_shuffle,
+    )
+    aiter_config = select_aiter_moe_config(problem, cache_owner=w1)
+    if aiter_config is None:
+        native_expert_map, _ = resolve_aiter_expert_maps(
+            expert_mask,
+            global_num_experts,
+        )
+        if swiglu_limit:
+            raise HcuAiterRuntimeError(
+                "vLLM Triton W16A16 fallback does not support swiglu_limit"
+            )
+        if output_dtype not in (None, hidden_states.dtype):
+            raise HcuAiterRuntimeError(
+                "vLLM Triton W16A16 fallback cannot override output_dtype"
+            )
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            fused_experts_impl,
         )
 
-    try:
-        from aiter.fused_moe_asm_wna16 import fused_experts_asm_impl
-    except Exception as exc:
-        raise HcuAiterRuntimeError(
-            "HCU AITER direct W16A16 ASM path was selected, but "
-            "aiter.fused_moe_asm_wna16.fused_experts_asm_impl is unavailable"
-        ) from exc
-    return fused_experts_asm_impl(
-        hidden_states,
+        return fused_experts_impl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            global_num_experts=global_num_experts,
+            expert_map=native_expert_map,
+        )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
         w1,
         w2,
-        topk_weight,
-        topk_ids,
-        output_dtype or hidden_states.dtype,
-        **direct_kwargs,
+        aiter_config,
+        cache_owner=w1,
+    )
+    solution = getattr(aiter_config, "solution_type", None)
+    solution = getattr(solution, "value", solution)
+    if str(solution).rsplit(".", 1)[-1].upper() == "ASM":
+        aiter_expert_map = expert_mask
+    else:
+        aiter_expert_map, _ = resolve_aiter_expert_maps(
+            expert_mask,
+            global_num_experts,
+        )
+    return execute_aiter_moe(
+        aiter_config,
+        hidden_states=hidden_states,
+        w1=prepared_w1,
+        w2=prepared_w2,
+        topk_weights=topk_weight,
+        topk_ids=topk_ids,
+        inplace=False,
+        activation=activation,
+        global_num_experts=global_num_experts,
+        expert_map=aiter_expert_map,
+        use_weight_shuffle=bool(
+            getattr(aiter_config, "need_shuffle", False)
+        ),
+        output_dtype=output_dtype or hidden_states.dtype,
+        gemm1_limit=swiglu_limit or None,
     )
 
 
@@ -1028,9 +1022,9 @@ __all__ = [
     "fused_moe_impl",
     "get_aiter_activation_type",
     "get_gelu_tanh_activation_type",
-    "get_w16a16_moe_config",
-    "get_w16a16_moe_solution_id",
     "is_aiter_found_and_supported",
+    "is_aiter_moe_explicitly_disabled",
+    "is_aiter_moe_requested",
     "rmsnorm_add_dynamic_quant_impl",
     "rmsnorm_dynamic_quant_impl",
     "triton_rope_and_cache_impl",
