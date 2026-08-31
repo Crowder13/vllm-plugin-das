@@ -17,8 +17,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  HARBOR_SITE: ${{ vars.HARBOR_SITE }}
-  HARBOR_NAMESPACE: jenkins/model_test_env
   PYPI_URL: ${{ vars.PYPI_URL }}
   VLLM_VERSION: "0.25.1"
 
@@ -26,7 +24,7 @@ jobs:
   citest:
     runs-on: nmz36
     container:
-      image: ${{ env.HARBOR_SITE }}/${{ env.HARBOR_NAMESPACE }}/vllm:${{ env.VLLM_VERSION }}-latest
+      image: ${{ vars.HARBOR_SITE }}/${{ vars.HARBOR_NAMESPACE }}/vllm:0.25.1-latest
       options: --privileged --cap-add=SYS_PTRACE --network=host --device /dev/kfd:/dev/kfd --device /dev/dri:/dev/dri
       volumes:
         - /public/opendas/DL_DATA/llm-models:/models/public:ro
@@ -41,15 +39,14 @@ jobs:
       - name: 安装 CItest
         run: |
           PYPI_HOST=$(echo "${PYPI_URL}" | sed -E 's#^https?://##; s#:.*##')
-          pip install citest[evalscope] cinotificate \
+          pip install citest[evalscope] \
             -i "${PYPI_URL}/nightly/dtk2604/+simple/" \
             --trusted-host "${PYPI_HOST}"
 
       - name: 运行 CItest
         run: |
           CItest --test_tool evalscope \
-                 --case_conf .github/workflows/configs/image-citest-conf-hcu.yaml \
-                 --parallel 4 \
+                 --case_conf docker/image-citest-conf-hcu.yaml \
                  --models_path /models \
                  --output_dir "${GITHUB_WORKSPACE}/citest-output"
 
