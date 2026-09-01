@@ -5,21 +5,39 @@ from __future__ import annotations
 
 import ast
 import enum
+import inspect
+import logging
 import os
 import subprocess
 import sys
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_hcu.model_executor.layers.fused_moe import aiter_runtime
+from vllm_hcu.model_executor.layers.fused_moe import (
+    aiter_moe_dispatch,
+    aiter_runtime,
+)
+from vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch import (
+    AiterMoeProblem,
+    HcuAiterMoeDispatchError,
+    aiter_expert_map_for_solution,
+    execute_aiter_moe,
+    prepare_aiter_moe_scales,
+    prepare_aiter_moe_weights,
+    select_aiter_moe_config,
+)
 from vllm_hcu.model_executor.layers.quantization import (
     compressed_tensors_moe_runtime,
     int8_runtime,
     lightop_fp8_runtime,
 )
+from vllm_hcu.platforms import envs as henvs
 from vllm_hcu.patch.worker.op_opt import (
     patch_activation,
     patch_aiter_ops,
@@ -60,6 +78,726 @@ def _fp8_quant_abi_stub(
 ):
     del quant_dtype, num_rows, num_rows_factor
     return x, scale
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, True),
+        ("0", False),
+        ("1", True),
+    ],
+)
+def test_unified_aiter_moe_shuffle_env(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str | None,
+    expected: bool,
+):
+    if value is None:
+        monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", value)
+
+    henvs.resolve_aiter_moe_shuffle.cache_clear()
+    assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is expected
+
+
+def test_removed_w16a16_shuffle_env_cannot_change_unified_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("VLLM_HCU_USE_AITER_MOE_SHUFFLE", raising=False)
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", "0")
+    henvs.resolve_aiter_moe_shuffle.cache_clear()
+
+    assert henvs.VLLM_HCU_USE_AITER_MOE_SHUFFLE is True
+    with pytest.raises(AttributeError):
+        getattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE")
+
+
+def test_unified_aiter_moe_config_disable_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    monkeypatch.setenv("VLLM_HCU_USE_AITER_MOE_CONFIG", "0")
+    henvs.resolve_aiter_moe_config_compat.cache_clear()
+
+    with caplog.at_level("WARNING", logger=henvs.__name__):
+        assert henvs.VLLM_HCU_USE_AITER_MOE_CONFIG is True
+
+    assert any(
+        "deprecated and ignored" in record.message for record in caplog.records
+    )
+
+
+def test_aiter_dispatch_selector_passes_problem_without_forcing_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected_config = SimpleNamespace(solution_type="triton")
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, expected_config
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    problem = AiterMoeProblem(
+        M=2,
+        E=4,
+        N1=16,
+        N2=8,
+        K=8,
+        top_k=2,
+        block_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+        activation="silu",
+        use_shuffle=True,
+    )
+
+    actual = select_aiter_moe_config(problem, cache_owner=torch.empty(1))
+
+    assert actual is expected_config
+    assert captured == {
+        "M": 2,
+        "E": 4,
+        "N1": 16,
+        "N2": 8,
+        "K": 8,
+        "top_k": 2,
+        "block_size": 0,
+        "dtype": torch.bfloat16,
+        "quant_type": "w16a16",
+        "activation": "silu",
+        "use_shuffle": 1,
+    }
+    assert "spec_sol_type" not in captured
+    assert "device" not in captured
+
+
+def test_aiter_dispatch_selector_returns_none_only_for_explicit_no_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+    )
+
+    assert select_aiter_moe_config(problem, cache_owner=object()) is None
+
+
+def test_aiter_dispatch_prewarm_m1_does_not_gate_supported_runtime_shape(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[int] = []
+
+    def get_config(**kwargs: object):
+        m = int(kwargs["M"])
+        calls.append(m)
+        if m == 1:
+            return False, None
+        return True, SimpleNamespace(solution_type=f"route-m{m}")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    owner = torch.empty(1)
+    runtime_problem = AiterMoeProblem(
+        M=64,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    assert (
+        aiter_moe_dispatch.prewarm_aiter_moe_config(
+            runtime_problem,
+            cache_owner=owner,
+        )
+        is None
+    )
+    runtime_config = select_aiter_moe_config(
+        runtime_problem,
+        cache_owner=owner,
+    )
+    cached_config = select_aiter_moe_config(
+        runtime_problem,
+        cache_owner=owner,
+    )
+
+    assert runtime_config.solution_type == "route-m64"
+    assert cached_config is runtime_config
+    assert calls == [1, 64]
+
+
+def test_aiter_dispatch_prewarm_m1_keeps_actual_m_routing_dynamic(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[int] = []
+
+    def get_config(**kwargs: object):
+        m = int(kwargs["M"])
+        calls.append(m)
+        return True, SimpleNamespace(solution_type=f"route-m{m}")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    owner = torch.empty(1)
+    runtime_problem = AiterMoeProblem(
+        M=64,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    warm_config = aiter_moe_dispatch.prewarm_aiter_moe_config(
+        runtime_problem,
+        cache_owner=owner,
+    )
+    runtime_config = select_aiter_moe_config(runtime_problem, cache_owner=owner)
+    cached_config = select_aiter_moe_config(runtime_problem, cache_owner=owner)
+
+    assert warm_config.solution_type == "route-m1"
+    assert runtime_config.solution_type == "route-m64"
+    assert cached_config is runtime_config
+    assert calls == [1, 64]
+
+
+def test_aiter_dispatch_selector_rejects_success_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (True, None),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=3,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    with pytest.raises(HcuAiterMoeDispatchError, match="status=True"):
+        select_aiter_moe_config(problem, cache_owner=object())
+
+
+def test_aiter_dispatch_selector_rejects_non_boolean_status(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (None, object()),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=3,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    with pytest.raises(HcuAiterMoeDispatchError, match="boolean status"):
+        select_aiter_moe_config(problem, cache_owner=object())
+
+
+def test_aiter_dispatch_selection_cache_retains_more_than_eight_m_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[int] = []
+
+    def get_config(**kwargs: object):
+        calls.append(int(kwargs["M"]))
+        return True, SimpleNamespace(solution_type="asm")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=get_config),
+    )
+    owner = torch.empty(1)
+    problems = [
+        AiterMoeProblem(
+            M=m,
+            E=2,
+            N1=4,
+            N2=2,
+            K=2,
+            top_k=1,
+            block_size=0,
+            dtype=torch.float16,
+            device=torch.device("cpu"),
+            quant_type="w8a8",
+        )
+        for m in range(1, 17)
+    ]
+    for problem in problems:
+        select_aiter_moe_config(problem, cache_owner=owner)
+    select_aiter_moe_config(problems[0], cache_owner=owner)
+
+    assert calls == list(range(1, 17))
+
+
+@pytest.mark.parametrize(
+    ("status", "config", "message", "level"),
+    [
+        (
+            True,
+            SimpleNamespace(solution_type="asm"),
+            "selected ASM",
+            logging.DEBUG,
+        ),
+        (
+            False,
+            None,
+            "falling back to vLLM Triton MoE",
+            logging.WARNING,
+        ),
+    ],
+)
+def test_aiter_dispatch_logs_each_problem_once_across_cache_owners(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: bool,
+    config: object | None,
+    message: str,
+    level: int,
+):
+    monkeypatch.setattr(
+        aiter_moe_dispatch,
+        "_ROUTE_LOG_CACHE",
+        OrderedDict(),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (status, config),
+        ),
+    )
+    problem = AiterMoeProblem(
+        M=3,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+    owners = (torch.empty(1), torch.empty(1))
+
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="vllm_hcu.model_executor.layers.fused_moe.aiter_moe_dispatch",
+    ):
+        for owner in owners:
+            select_aiter_moe_config(problem, cache_owner=owner)
+
+    matching = [
+        record for record in caplog.records if message in record.getMessage()
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == level
+
+
+def test_aiter_dispatch_route_log_cache_is_atomic_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    route_cache: OrderedDict[AiterMoeProblem, None] = OrderedDict()
+    monkeypatch.setattr(aiter_moe_dispatch, "_ROUTE_LOG_CACHE", route_cache)
+    problem = AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=4,
+        N2=2,
+        K=2,
+        top_k=1,
+        block_size=0,
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+        quant_type="w8a8",
+    )
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        recorded = list(
+            pool.map(
+                lambda _: aiter_moe_dispatch._mark_route_logged(problem),
+                range(64),
+            )
+        )
+
+    assert sum(recorded) == 1
+    limit = aiter_moe_dispatch._ROUTE_LOG_CACHE_LIMIT
+    for m in range(2, limit + 2):
+        assert aiter_moe_dispatch._mark_route_logged(
+            replace(problem, M=m)
+        )
+    assert len(route_cache) == limit
+    assert problem not in route_cache
+
+
+@pytest.mark.parametrize(
+    ("solution", "need_shuffle", "should_shuffle"),
+    [
+        ("asm", True, True),
+        ("moe_c", True, True),
+        ("triton", False, False),
+        ("ck", False, False),
+    ],
+)
+def test_aiter_dispatch_prepares_solution_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    solution: str,
+    need_shuffle: bool,
+    should_shuffle: bool,
+):
+    calls: list[object] = []
+
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        calls.append(config)
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type=solution,
+        need_shuffle=need_shuffle,
+        config={"layout": solution},
+    )
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+
+    actual_w1, actual_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+    )
+
+    assert bool(calls) is should_shuffle
+    assert (actual_w1 is not w1) is should_shuffle
+    assert (actual_w2 is not w2) is should_shuffle
+
+
+def test_aiter_dispatch_prepares_weight_cache_tracks_generation_and_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, str]] = []
+
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        calls.append(dict(config.config))
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"PADDED_K": 4},
+    )
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+
+    first = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    second = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+    assert calls == [{"PADDED_K": 4}]
+
+    w1.add_(1)
+    third = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert third[0] is not first[0]
+
+    config.config["PADDED_K"] = 8
+    fourth = prepare_aiter_moe_weights(w1, w2, config, cache_owner=w1)
+    assert fourth[0] is not third[0]
+    assert calls == [
+        {"PADDED_K": 4},
+        {"PADDED_K": 4},
+        {"PADDED_K": 8},
+    ]
+
+
+def test_aiter_dispatch_can_preserve_weights_from_mutating_shuffle(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        del config
+        w1.add_(1)
+        w2.add_(2)
+        return w1, w2
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={},
+    )
+    w1 = torch.ones((2, 8, 4), dtype=torch.int8)
+    w2 = torch.ones((2, 4, 4), dtype=torch.int8)
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        w1,
+        w2,
+        config,
+        cache_owner=w1,
+        preserve_inputs=True,
+    )
+
+    torch.testing.assert_close(w1, torch.ones_like(w1))
+    torch.testing.assert_close(w2, torch.ones_like(w2))
+    torch.testing.assert_close(prepared_w1, torch.full_like(w1, 2))
+    torch.testing.assert_close(prepared_w2, torch.full_like(w2, 3))
+    assert prepared_w1 is not w1
+    assert prepared_w2 is not w2
+
+
+def test_aiter_dispatch_weight_cache_ignores_tuning_solution_ids(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[object] = []
+
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        calls.append(config)
+        return w1.clone(), w2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    first_config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"SOL_ID1": 10006, "SOL_ID2": 20000, "BLOCK_SIZE_M": 16},
+    )
+    second_config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=True,
+        config={"SOL_ID1": 11002, "SOL_ID2": 21001, "BLOCK_SIZE_M": 32},
+    )
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+
+    first = prepare_aiter_moe_weights(w1, w2, first_config, cache_owner=w1)
+    second = prepare_aiter_moe_weights(w1, w2, second_config, cache_owner=w1)
+
+    assert len(calls) == 1
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+
+
+def test_aiter_dispatch_accepts_public_padded_k_weight_layout(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def shuffle(w1: torch.Tensor, w2: torch.Tensor, config: object):
+        del config
+        return torch.zeros((2, 8, 6)), torch.zeros((2, 6, 4))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_weight=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="fp8_w8a8",
+        solution_type="moe_c",
+        need_shuffle=True,
+        config={"ORIGINAL_K": 4, "PADDED_K": 6},
+    )
+
+    prepared_w1, prepared_w2 = prepare_aiter_moe_weights(
+        torch.ones((2, 8, 4)),
+        torch.ones((2, 4, 4)),
+        config,
+        cache_owner=object(),
+    )
+
+    assert prepared_w1.shape == (2, 8, 6)
+    assert prepared_w2.shape == (2, 6, 4)
+
+
+def test_aiter_runtime_maps_swigluoai_activation_method():
+    assert aiter_runtime._activation_name(2) == "swigluoai"
+
+
+def test_aiter_dispatch_prepares_scale_layout_and_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[object] = []
+
+    def shuffle(scale1: torch.Tensor, scale2: torch.Tensor, config: object):
+        calls.append(config)
+        return scale1.clone(), scale2.clone()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe_shfl_scale=shuffle),
+    )
+    config = SimpleNamespace(
+        quant_type="w8a8",
+        solution_type="asm",
+        need_shuffle_scale=True,
+        config={"scale_layout": 1},
+    )
+    scale1 = torch.ones((2, 8))
+    scale2 = torch.ones((2, 4))
+
+    first = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=scale1,
+    )
+    second = prepare_aiter_moe_scales(
+        scale1,
+        scale2,
+        config,
+        cache_owner=scale1,
+    )
+
+    assert first[0] is not scale1
+    assert first[1] is not scale2
+    assert second[0] is first[0]
+    assert second[1] is first[1]
+    assert calls == [config]
+
+
+@pytest.mark.parametrize("solution", ["moe_c", "triton", "ck"])
+def test_aiter_dispatch_expert_map_preserves_non_asm_solutions(solution: str):
+    expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    config = SimpleNamespace(solution_type=solution)
+
+    actual = aiter_expert_map_for_solution(expert_map, config, 4)
+
+    assert actual is expert_map
+
+
+def test_aiter_dispatch_expert_map_converts_asm_to_mask():
+    expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    config = SimpleNamespace(solution_type="asm")
+
+    actual = aiter_expert_map_for_solution(expert_map, config, 4)
+
+    torch.testing.assert_close(
+        actual,
+        torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32),
+    )
+
+
+def test_aiter_dispatch_execute_uses_public_aiter_moe(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, object] = {}
+    expected = torch.ones((2, 4))
+
+    def aiter_moe(**kwargs: object):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module("aiter.moe", aiter_moe=aiter_moe),
+    )
+    hidden_states = torch.ones((2, 4))
+    w1 = torch.ones((2, 8, 4))
+    w2 = torch.ones((2, 4, 4))
+    topk_weights = torch.ones((2, 1))
+    topk_ids = torch.zeros((2, 1), dtype=torch.int32)
+    config = SimpleNamespace(solution_type="triton")
+
+    actual = execute_aiter_moe(
+        config,
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation="silu",
+        global_num_experts=2,
+    )
+
+    assert actual is expected
+    assert captured["moe_config"] is config
+    assert captured["w1"] is w1
+    assert captured["w2"] is w2
+    assert captured["global_num_experts"] == 2
 
 
 def test_aiter_asm_int8_quant_context_routes_only_enabled_calls(
@@ -664,6 +1402,29 @@ def test_int8_oracle_keeps_aiter_weights_and_packs_hcu_deep_gemm_weights(
     assert quant_config.per_act_token_quant is True
     assert quant_config.a1_scale is None
     assert quant_config.a2_scale is None
+    prewarm_calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_quantized_moe",
+        lambda layer, moe, quant: prewarm_calls.append((layer, moe, quant)),
+    )
+    aiter_layer = _fp8_moe_layer()
+    aiter_moe_config = SimpleNamespace(
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+        moe_parallel_config=SimpleNamespace(
+            use_deepep_auto_kernels=False,
+        ),
+    )
+    assert target.make_int8_moe_kernel(
+        target.Int8MoeBackend.AITER,
+        quant_config,
+        aiter_moe_config,
+        AiterExperts,
+        layer=aiter_layer,
+    ) == "official-int8-kernel"
+    assert prewarm_calls == [(aiter_layer, aiter_moe_config, quant_config)]
 
     config = SimpleNamespace(
         moe_backend="deep_gemm",
@@ -1718,37 +2479,9 @@ def test_workspace_aiter_rope_and_cache_composes_public_ops(
 
 
 def test_hcu_aiter_moe_uses_v0251_out_of_place_contract():
-    repo = Path(__file__).resolve().parents[2]
-    sources = (
-        repo
-        / "vllm_hcu/model_executor/layers/quantization/"
-        "compressed_tensors_moe_runtime.py",
-        repo
-        / "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
-        "compressed_tensors_moe_marlin.py",
-    )
-
-    for source_path in sources:
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        assert not any(
-            isinstance(node, ast.Attribute) and node.attr == "disable_inplace"
-            for node in ast.walk(tree)
-        ), source_path
-        calls = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "aiter_moe"
-        ]
-        assert calls, source_path
-        for call in calls:
-            inplace = next(
-                (keyword.value for keyword in call.keywords if keyword.arg == "inplace"),
-                None,
-            )
-            assert isinstance(inplace, ast.Constant), source_path
-            assert inplace.value is False, source_path
+    signature = inspect.signature(execute_aiter_moe)
+    assert signature.parameters["inplace"].default is False
+    assert "disable_inplace" not in signature.parameters
 
 
 def test_aiter_gelu_tanh_and_feature_off_delegation(
@@ -1843,97 +2576,72 @@ def test_aiter_gate_mode_requires_compatible_abi():
         )
 
 
-def test_aiter_w16a16_asm_selection(monkeypatch: pytest.MonkeyPatch):
+def test_aiter_w16a16_routes_public_api_with_canonical_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
     _install_fake_aiter(monkeypatch)
-    _install_fake_vllm_envs(
-        monkeypatch,
-        VLLM_ROCM_USE_AITER=True,
-        VLLM_ROCM_USE_AITER_MOE=True,
-    )
-    asm_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def asm(*args, **kwargs):
-        asm_calls.append((args, kwargs))
-        return "asm"
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.fused_moe_asm_wna16",
-        _module("aiter.fused_moe_asm_wna16", fused_experts_asm_impl=asm),
-    )
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
     x = torch.ones(2, 4)
     w1 = torch.ones(3, 8, 4)
     w2 = torch.ones(3, 4, 4)
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
-
-    def upstream(*args):
-        raise AssertionError("ASM selection must not delegate")
-
-    assert (
-        aiter_runtime.fused_moe_impl(
-            upstream, x, w1, w2, topk_weight, topk_ids, activation_method=3
-        )
-        == "asm"
+    expected = torch.full_like(x, 7)
+    selector_calls: list[dict[str, object]] = []
+    execute_calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="moe_c",
+        need_shuffle=False,
+        config={},
     )
-    assert asm_calls[0][1] == {
-        "activation": "gelu_tanh",
-        "global_num_experts": 3,
-        "expert_map": None,
-        "use_shuffle": 0,
-    }
 
-    assert (
-        aiter_runtime.fused_moe_impl(
-            upstream,
-            x,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            activation_method=3,
-            swiglu_limit=7.5,
-        )
-        == "asm"
+    def get_config(**kwargs: object):
+        selector_calls.append(kwargs)
+        return True, config
+
+    def aiter_moe(**kwargs: object):
+        execute_calls.append(kwargs)
+        return expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
     )
-    assert asm_calls[1][1]["gemm1_limit"] == 7.5
 
-    with pytest.raises(
-        aiter_runtime.HcuAiterRuntimeError,
-        match="has no gate_mode ABI.*gate_mode",
-    ):
-        aiter_runtime.fused_moe_impl(
-            upstream,
-            x,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            gate_mode="interleave",
-        )
-    with pytest.raises(
-        aiter_runtime.HcuAiterRuntimeError,
-        match="has no sorting-dispatch ABI.*moe_sorting_dispatch_policy",
-    ):
-        aiter_runtime.fused_moe_impl(
-            upstream,
-            x,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            moe_sorting_dispatch_policy=2,
-        )
+    actual = aiter_runtime.fused_moe_impl(
+        lambda *unused: pytest.fail("selected AITER config must not delegate"),
+        x,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        activation_method=3,
+        swiglu_limit=7.5,
+    )
+
+    assert actual is expected
+    assert selector_calls[0]["N1"] == 8
+    assert selector_calls[0]["N2"] == 4
+    assert selector_calls[0]["K"] == 4
+    assert selector_calls[0]["use_shuffle"] == 1
+    assert "spec_sol_type" not in selector_calls[0]
+    assert execute_calls[0]["w1"] is w1
+    assert execute_calls[0]["w2"] is w2
+    assert execute_calls[0]["activation"] == "gelu_tanh"
+    assert execute_calls[0]["gemm1_limit"] == 7.5
 
 
-@pytest.mark.parametrize("use_shuffle", [False, True])
-def test_aiter_w16a16_weight_preparation_bypasses_rocm_padding(
+def test_aiter_w16a16_post_load_preserves_canonical_parameters(
     monkeypatch: pytest.MonkeyPatch,
-    use_shuffle: bool,
 ):
     from vllm_hcu.model_executor.layers.fused_moe import (
         unquantized_fused_moe_method as hcu_unquantized,
@@ -1951,69 +2659,70 @@ def test_aiter_w16a16_weight_preparation_bypasses_rocm_padding(
         layer_name="model.layers.0.mlp.experts",
     )
     method = object.__new__(hcu_unquantized.HcuUnquantizedFusedMoEMethod)
-    method.moe = SimpleNamespace()
+    method.moe = SimpleNamespace(
+        num_experts=2,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        activation=SimpleNamespace(value="silu"),
+    )
     method.unquantized_backend = hcu_unquantized.UnquantizedMoeBackend.AITER
     method.experts_cls = object
     method.get_fused_moe_quant_config = lambda unused_layer: object()
 
-    def emulate_rocm_padding(weight: torch.Tensor) -> torch.Tensor:
-        padded = torch.nn.functional.pad(weight, (0, 1))[..., :-1]
-        assert not padded.is_contiguous()
-        return padded
-
-    method._maybe_pad_weight = emulate_rocm_padding
     monkeypatch.setattr(
         hcu_unquantized,
-        "_is_hcu_aiter_moe_asm_requested",
+        "_is_hcu_aiter_moe_requested",
         lambda method=None: True,
     )
-    monkeypatch.setattr(
-        hcu_unquantized,
-        "_raise_if_aiter_moe_asm_blocked",
-        lambda *args: None,
-    )
-    monkeypatch.setattr(
-        hcu_unquantized.henvs,
-        "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE",
-        use_shuffle,
-    )
+    kernels: list[dict[str, object]] = []
     monkeypatch.setattr(
         hcu_unquantized,
         "make_unquantized_moe_kernel",
-        lambda **kwargs: object(),
+        lambda **kwargs: kernels.append(kwargs) or object(),
     )
-
-    shuffle_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
-
-    def shuffle_weights(w1, w2, unused_config):
-        shuffle_inputs.append((w1, w2))
-        return w1.contiguous(), w2.contiguous()
-
+    prewarm_calls: list[tuple[AiterMoeProblem, object]] = []
+    monkeypatch.setattr(
+        hcu_unquantized,
+        "prewarm_aiter_moe_config",
+        lambda problem, cache_owner: prewarm_calls.append(
+            (problem, cache_owner)
+        ),
+        raising=False,
+    )
     monkeypatch.setitem(
         sys.modules,
         "aiter.moe",
-        _module(
-            "aiter.moe",
-            AiterMoeConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-            MoeQuantType=SimpleNamespace(W16A16="w16a16"),
-            MoeSolutionType=SimpleNamespace(ASM="asm"),
-            aiter_moe_shfl_weight=shuffle_weights,
-        ),
+        _module("aiter.moe"),
     )
 
     method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
 
-    if use_shuffle:
-        assert len(shuffle_inputs) == 1
-        assert all(weight.is_contiguous() for weight in shuffle_inputs[0])
-    else:
-        assert layer.w13_weight is w13
-        assert layer.w2_weight is w2
-        assert layer.w13_weight.is_contiguous()
-        assert layer.w2_weight.is_contiguous()
+    assert layer.w13_weight is w13
+    assert layer.w2_weight is w2
+    assert len(kernels) == 1
+    assert method.moe_kernel is not None
+    assert len(prewarm_calls) == 1
+    problem, cache_owner = prewarm_calls[0]
+    assert problem == AiterMoeProblem(
+        M=1,
+        E=2,
+        N1=8,
+        N2=4,
+        K=4,
+        top_k=2,
+        block_size=0,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        quant_type="w16a16",
+        activation="silu",
+        use_shuffle=True,
+    )
+    assert cache_owner is w13
 
 
-def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
+def test_explicit_aiter_backend_uses_public_router_without_auto_env_gate(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _install_fake_aiter(monkeypatch)
@@ -2022,28 +2731,41 @@ def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
         VLLM_ROCM_USE_AITER=False,
         VLLM_ROCM_USE_AITER_MOE=False,
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.fused_moe_asm_wna16",
-        _module(
-            "aiter.fused_moe_asm_wna16",
-            fused_experts_asm_impl=lambda *args, **kwargs: (args, kwargs),
-        ),
-    )
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
     x = torch.ones(2, 4)
     w1 = torch.ones(3, 8, 4)
     w2 = torch.ones(3, 4, 4)
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
+    expected = torch.full_like(x, 3)
+    calls: list[dict[str, object]] = []
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=False,
+        config={},
+    )
+
+    def execute(**kwargs: object):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (True, config),
+            aiter_moe=execute,
+        ),
+    )
 
     with aiter_runtime.aiter_moe_request_context(
         SimpleNamespace(moe_backend="aiter")
     ):
-        args, kwargs = aiter_runtime.fused_moe_impl(
+        actual = aiter_runtime.fused_moe_impl(
             lambda *unused: pytest.fail("explicit AITER must not delegate"),
             x,
             w1,
@@ -2051,13 +2773,10 @@ def test_explicit_aiter_backend_selects_asm_without_auto_env_gate(
             topk_weight,
             topk_ids,
         )
-    assert all(
-        actual is expected
-        for actual, expected in zip(
-            args[:5], (x, w1, w2, topk_weight, topk_ids)
-        )
-    )
-    assert kwargs["activation"] == "silu"
+    assert actual is expected
+    assert calls[0]["w1"] is w1
+    assert calls[0]["w2"] is w2
+    assert calls[0]["activation"] == "silu"
 
 
 def test_explicit_aiter_backend_enables_mask_construction_from_current_config(
@@ -2080,112 +2799,165 @@ def test_explicit_aiter_backend_enables_mask_construction_from_current_config(
     assert aiter_runtime.is_aiter_moe_requested()
 
 
-def test_configured_w16a16_prefers_direct_asm(
+def test_explicit_triton_backend_overrides_enabled_aiter_env(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    _install_fake_aiter(monkeypatch)
     _install_fake_vllm_envs(
         monkeypatch,
         VLLM_ROCM_USE_AITER=True,
         VLLM_ROCM_USE_AITER_MOE=True,
     )
+    moe_config = SimpleNamespace(moe_backend="triton", num_experts=4)
+
+    assert not aiter_runtime.is_aiter_moe_requested(moe_config)
+    with aiter_runtime.aiter_moe_request_context(moe_config):
+        assert not aiter_runtime.is_aiter_moe_requested()
+
+
+def test_explicit_triton_backend_overrides_legacy_w4a16_aiter_flag(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
+
+    layer = SimpleNamespace(
+        moe_config=SimpleNamespace(moe_backend="triton")
+    )
+
+    assert not patch_compressed_tensors_moe_wna16._aiter_requested(layer)
+
+
+def test_aiter_w16a16_no_solution_falls_back_to_vllm_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
-    monkeypatch.setattr(
-        aiter_runtime,
-        "get_w16a16_moe_config",
-        lambda *args, **kwargs: object(),
-    )
-    monkeypatch.setattr(
-        aiter_runtime,
-        "get_w16a16_moe_solution_id",
-        lambda *args, **kwargs: "4+9",
-    )
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    fallback_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    expected = torch.full((2, 6), 5, dtype=torch.bfloat16)
 
-    def unified_aiter(**kwargs):
-        pytest.fail("configured W16A16 must not call aiter.moe.aiter_moe")
+    def fallback(*args: object, **kwargs: object):
+        fallback_calls.append((args, kwargs))
+        return expected
 
-    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def direct_asm(*args, **kwargs):
-        calls.append((args, kwargs))
-        return "direct-asm"
+    monkeypatch.setattr(fused_moe_module, "fused_experts_impl", fallback)
 
     monkeypatch.setitem(
         sys.modules,
         "aiter.moe",
-        _module("aiter.moe", aiter_moe=unified_aiter),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.fused_moe_asm_wna16",
         _module(
-            "aiter.fused_moe_asm_wna16",
-            fused_experts_asm_impl=direct_asm,
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+            aiter_moe=lambda **kwargs: pytest.fail(
+                "no-solution must not execute AITER"
+            ),
         ),
     )
 
     hidden_states = torch.ones(2, 6, dtype=torch.bfloat16)
-    w1 = torch.ones(3, 8, 6, dtype=torch.bfloat16)
-    w2 = torch.ones(3, 6, 4, dtype=torch.bfloat16)
+    w1 = torch.ones(2, 8, 6, dtype=torch.bfloat16)
+    w2 = torch.ones(2, 6, 4, dtype=torch.bfloat16)
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
+    native_expert_map = torch.tensor([1, -1, 0, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
 
-    assert (
-        aiter_runtime.fused_moe_impl(
-            lambda *unused: pytest.fail("AITER ASM must not delegate"),
+    with aiter_runtime.aiter_moe_request_context(
+        SimpleNamespace(moe_backend="aiter", num_experts=4)
+    ):
+        actual = aiter_runtime.fused_moe_impl(
+            lambda *unused: pytest.fail("no-solution uses vLLM Triton directly"),
             hidden_states,
             w1,
             w2,
             topk_weight,
             topk_ids,
+            expert_mask=expert_mask,
         )
-        == "direct-asm"
-    )
-    assert calls[0][1] == {
-        "activation": "silu",
-        "global_num_experts": 3,
-        "expert_map": None,
-        "use_shuffle": 1,
-        "solution_id": "4+9",
-    }
+
+    assert actual is expected
+    assert fallback_calls[0][0][1] is w1
+    assert fallback_calls[0][0][2] is w2
+    assert fallback_calls[0][1]["use_fp8_w8a8"] is False
+    assert fallback_calls[0][1]["use_int8_w8a8"] is False
+    assert fallback_calls[0][1]["use_int8_w8a16"] is False
+    assert fallback_calls[0][1]["use_int4_w4a16"] is False
+    assert fallback_calls[0][1]["global_num_experts"] == 4
+    assert fallback_calls[0][1]["expert_map"] is native_expert_map
 
 
-def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
+def test_aiter_w16a16_config_fault_does_not_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _install_fake_aiter(monkeypatch)
-    _install_fake_vllm_envs(
-        monkeypatch,
-        VLLM_ROCM_USE_AITER=True,
-        VLLM_ROCM_USE_AITER_MOE=True,
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    fallback_calls: list[object] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
     )
-    from vllm_hcu.platforms import envs as henvs
-
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
-    captured: dict[str, object] = {}
-    calls: list[dict[str, object]] = []
-
-    def get_solution(**kwargs):
-        captured.update(kwargs)
-        return "4+9"
-
-    def direct_asm(*args, **kwargs):
-        calls.append(kwargs)
-        return "direct-aiter"
-
     monkeypatch.setattr(
-        aiter_runtime, "get_w16a16_moe_solution_id", get_solution
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
     )
+
+    def config_fault(**kwargs: object):
+        raise RuntimeError("aiter config fault")
+
     monkeypatch.setitem(
         sys.modules,
-        "aiter.fused_moe_asm_wna16",
+        "aiter.moe",
+        _module("aiter.moe", get_aiter_moe_config=config_fault),
+    )
+    tensors = (
+        torch.ones(2, 4),
+        torch.ones(3, 8, 4),
+        torch.ones(3, 4, 4),
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+    )
+
+    with pytest.raises(RuntimeError, match="aiter config fault"):
+        aiter_runtime.fused_moe_impl(lambda *unused: None, *tensors)
+    assert fallback_calls == []
+
+
+def test_aiter_w16a16_selector_uses_w2_output_dim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fake_aiter(monkeypatch)
+    monkeypatch.setattr(aiter_runtime, "is_aiter_moe_requested", lambda: True)
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
+    captured: dict[str, object] = {}
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=False,
+        config={},
+    )
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, config
+
+    expected = torch.ones(2, 6, dtype=torch.bfloat16)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
         _module(
-            "aiter.fused_moe_asm_wna16",
-            fused_experts_asm_impl=direct_asm,
+            "aiter.moe",
+            get_aiter_moe_config=get_config,
+            aiter_moe=lambda **kwargs: expected,
         ),
     )
     x = torch.ones(2, 6, dtype=torch.bfloat16)
@@ -2194,24 +2966,21 @@ def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
 
-    assert (
-        aiter_runtime.fused_moe_impl(
-            lambda *unused: pytest.fail("AITER ASM must not delegate"),
-            x,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-        )
-        == "direct-aiter"
+    actual = aiter_runtime.fused_moe_impl(
+        lambda *unused: pytest.fail("selected AITER config must not delegate"),
+        x,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
     )
 
+    assert actual is expected
     assert captured["N1"] == 8
     assert captured["E"] == 3
     assert captured["N2"] == 6
     assert captured["K"] == 6
-    assert calls[0]["solution_id"] == "4+9"
-    assert calls[0]["use_shuffle"] == 1
+    assert captured["use_shuffle"] == 1
 
     with pytest.raises(ValueError, match="unexpected MoE weight layout"):
         aiter_runtime.fused_moe_impl(
@@ -2224,39 +2993,39 @@ def test_aiter_w16a16_solution_lookup_uses_w2_output_dim(
         )
 
 
-def test_aiter_w16a16_solution_lookup_uses_global_expert_count_for_ep(
+def test_aiter_w16a16_non_asm_route_uses_global_expert_map_for_ep(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _install_fake_aiter(monkeypatch)
-    _install_fake_vllm_envs(
-        monkeypatch,
-        VLLM_ROCM_USE_AITER=True,
-        VLLM_ROCM_USE_AITER_MOE=True,
-    )
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", True)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", True)
     captured: dict[str, object] = {}
     calls: list[dict[str, object]] = []
-
-    def get_solution(**kwargs):
-        captured.update(kwargs)
-        return "4+9"
-
-    def direct_asm(*args, **kwargs):
-        calls.append(kwargs)
-        return "direct-aiter"
-
-    monkeypatch.setattr(
-        aiter_runtime, "get_w16a16_moe_solution_id", get_solution
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="triton",
+        need_shuffle=False,
+        config={},
     )
+
+    def get_config(**kwargs: object):
+        captured.update(kwargs)
+        return True, config
+
+    expected = torch.ones(2, 6, dtype=torch.bfloat16)
+
+    def execute(**kwargs: object):
+        calls.append(kwargs)
+        return expected
+
     monkeypatch.setitem(
         sys.modules,
-        "aiter.fused_moe_asm_wna16",
+        "aiter.moe",
         _module(
-            "aiter.fused_moe_asm_wna16",
-            fused_experts_asm_impl=direct_asm,
+            "aiter.moe",
+            get_aiter_moe_config=get_config,
+            aiter_moe=execute,
         ),
     )
     x = torch.ones(2, 6, dtype=torch.bfloat16)
@@ -2264,78 +3033,80 @@ def test_aiter_w16a16_solution_lookup_uses_global_expert_count_for_ep(
     w2 = torch.ones(2, 6, 4, dtype=torch.bfloat16)
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
+    native_expert_map = torch.tensor([1, -1, 0, -1], dtype=torch.int32)
     expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
 
     with aiter_runtime.aiter_moe_request_context(
         SimpleNamespace(moe_backend="aiter", num_experts=4)
     ):
-        assert (
-            aiter_runtime.fused_moe_impl(
-                lambda *unused: pytest.fail("AITER ASM must not delegate"),
-                x,
-                w1,
-                w2,
-                topk_weight,
-                topk_ids,
-                expert_mask=expert_mask,
-            )
-            == "direct-aiter"
+        actual = aiter_runtime.fused_moe_impl(
+            lambda *unused: pytest.fail("selected AITER config must not delegate"),
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=expert_mask,
         )
 
+    assert actual is expected
     assert captured["E"] == 4
     assert calls[0]["global_num_experts"] == 4
-    assert calls[0]["expert_map"] is expert_mask
-    assert calls[0]["solution_id"] == "4+9"
+    assert calls[0]["expert_map"] is native_expert_map
 
 
 def test_aiter_w16a16_asm_requires_mask_sentinel_and_rejects_expert_map(
     monkeypatch: pytest.MonkeyPatch,
 ):
     _install_fake_aiter(monkeypatch)
-    _install_fake_vllm_envs(
-        monkeypatch,
-        VLLM_ROCM_USE_AITER=True,
-        VLLM_ROCM_USE_AITER_MOE=True,
-    )
-    asm_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def asm(*args, **kwargs):
-        asm_calls.append((args, kwargs))
-        return "asm"
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.fused_moe_asm_wna16",
-        _module("aiter.fused_moe_asm_wna16", fused_experts_asm_impl=asm),
-    )
     from vllm_hcu.platforms import envs as henvs
 
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W16A16_MOE_SHUFFLE", False)
-    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_CONFIG", False)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_MOE_SHUFFLE", False)
     x = torch.ones(2, 4)
     w1 = torch.ones(2, 8, 4)
     w2 = torch.ones(2, 4, 4)
     topk_weight = torch.ones(2, 2)
     topk_ids = torch.zeros(2, 2, dtype=torch.int64)
     expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+    calls: list[dict[str, object]] = []
+    expected = torch.full_like(x, 9)
+    config = SimpleNamespace(
+        quant_type="w16a16",
+        solution_type="asm",
+        need_shuffle=False,
+        config={"SOL_ID1": 1, "SOL_ID2": 2},
+    )
+
+    def execute(**kwargs: object):
+        calls.append(kwargs)
+        return expected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            get_aiter_moe_config=lambda **kwargs: (True, config),
+            aiter_moe=execute,
+        ),
+    )
 
     moe_config = SimpleNamespace(moe_backend="aiter", num_experts=4)
     with aiter_runtime.aiter_moe_request_context(moe_config):
-        assert (
-            aiter_runtime.fused_moe_impl(
-                lambda *unused: pytest.fail("AITER ASM must not delegate"),
-                x,
-                w1,
-                w2,
-                topk_weight,
-                topk_ids,
-                expert_mask=expert_mask,
-            )
-            == "asm"
+        actual = aiter_runtime.fused_moe_impl(
+            lambda *unused: pytest.fail("AITER ASM must not delegate"),
+            x,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            expert_mask=expert_mask,
         )
 
-    assert asm_calls[0][1]["global_num_experts"] == 4
-    assert asm_calls[0][1]["expert_map"] is expert_mask
+    assert actual is expected
+    assert calls[0]["global_num_experts"] == 4
+    assert calls[0]["expert_map"] is expert_mask
 
     global_to_local_map = torch.tensor([0, 1, -1, -1], dtype=torch.int32)
     with aiter_runtime.aiter_moe_request_context(moe_config):
@@ -2403,43 +3174,6 @@ def test_aiter_feature_off_delegates_v0251_fused_moe_contract(
     assert calls[0][17] == "separated"
     assert calls[0][20] == 3
     assert calls[0][21] == 4.5
-
-
-def test_aiter_solution_lookup_success_and_failures(monkeypatch: pytest.MonkeyPatch):
-    class MoeQuantType:
-        W16A16 = "w16a16"
-
-    class MoeSolutionType:
-        ASM = "asm"
-
-    captured: dict[str, object] = {}
-
-    def get_config(**kwargs):
-        captured.update(kwargs)
-        return True, SimpleNamespace(
-            solution_type=MoeSolutionType.ASM,
-            config={"SOL_ID1": 4, "SOL_ID2": 9},
-        )
-
-    monkeypatch.setitem(
-        sys.modules,
-        "aiter.moe",
-        _module(
-            "aiter.moe",
-            MoeQuantType=MoeQuantType,
-            MoeSolutionType=MoeSolutionType,
-            get_aiter_moe_config=get_config,
-        ),
-    )
-    aiter_runtime.get_w16a16_moe_config.cache_clear()
-    aiter_runtime.get_w16a16_moe_solution_id.cache_clear()
-    assert (
-        aiter_runtime.get_w16a16_moe_solution_id(
-            1, 2, 3, 4, 5, 6, torch.bfloat16, "silu", 1
-        )
-        == "4+9"
-    )
-    assert captured["spec_sol_type"] == MoeSolutionType.ASM
 
 
 @pytest.mark.parametrize("extended", [False, True])
@@ -2742,8 +3476,14 @@ def test_slimquant_w4a8_moe_quant_config_uses_int4_weight_contract(
     assert len(calls) == 1
     call = calls[0]
     assert call["args"] == (torch.int8,)
-    assert call["w1_scale"] is layer.w13_weight_scale
-    assert call["w2_scale"] is layer.w2_weight_scale
+    torch.testing.assert_close(
+        call["w1_scale"], torch.full_like(layer.w13_weight_scale, 16.0)
+    )
+    torch.testing.assert_close(
+        call["w2_scale"], torch.full_like(layer.w2_weight_scale, 16.0)
+    )
+    torch.testing.assert_close(layer.w13_weight_scale, torch.ones(2, 4, 1))
+    torch.testing.assert_close(layer.w2_weight_scale, torch.ones(2, 2, 1))
     assert call["a1_scale"] is None
     assert call["a2_scale"] is None
     assert call["per_act_token_quant"] is True
@@ -2766,77 +3506,467 @@ def test_slimquant_w4a8_moe_method_is_a_direct_fused_moe_method():
 
 
 @pytest.mark.hcu
-def test_slimquant_w4a8_apply_uses_triton_channelwise_raw_packed_weights(
+def test_slimquant_w4a8_prewarms_m1_with_logical_packed_dimensions(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
     calls: list[dict[str, object]] = []
-
-    def fake_fused_experts_impl(*args, **kwargs):
-        calls.append({"args": args, "kwargs": kwargs})
-        hidden_states = args[0]
-        return hidden_states + 1
-
-    monkeypatch.setattr(
-        slimquant_w4a8.aiter_triton_fused_moe,
-        "fused_experts_impl",
-        fake_fused_experts_impl,
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
     )
 
-    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
-    w13_weight = torch.arange(2 * 4 * 2, dtype=torch.int8).reshape(2, 4, 2)
-    w2_weight = torch.arange(2 * 2 * 2, dtype=torch.int8).reshape(2, 2, 2)
-    w13_parameter = torch.nn.Parameter(w13_weight.clone(), requires_grad=False)
-    w2_parameter = torch.nn.Parameter(w2_weight.clone(), requires_grad=False)
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls.append(kwargs)
+        return True, selected
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            experts_per_token=2,
+            hidden_dim=4,
+            in_dtype=torch.bfloat16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=2,
+        ),
+    )
     layer = SimpleNamespace(
-        w13_weight=w13_parameter,
-        w2_weight=w2_parameter,
+        w13_weight=torch.nn.Parameter(
+            torch.zeros(2, 8, 2, dtype=torch.int8), requires_grad=False
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.zeros(2, 4, 2, dtype=torch.int8), requires_grad=False
+        ),
         w13_weight_scale=torch.nn.Parameter(
-            torch.ones(2, 4, 1), requires_grad=False
+            torch.ones(2, 8, 1), requires_grad=False
         ),
         w2_weight_scale=torch.nn.Parameter(
-            torch.ones(2, 2, 1), requires_grad=False
+            torch.ones(2, 4, 1), requires_grad=False
         ),
     )
 
     method.process_weights_after_loading(layer)
 
-    assert layer.w13_weight is w13_parameter
-    assert layer.w2_weight is w2_parameter
-    torch.testing.assert_close(layer.w13_weight.data, w13_weight)
-    torch.testing.assert_close(layer.w2_weight.data, w2_weight)
+    assert calls == [
+        {
+            "M": 1,
+            "E": 2,
+            "N1": 8,
+            "N2": 4,
+            "K": 4,
+            "top_k": 2,
+            "block_size": 0,
+            "dtype": torch.bfloat16,
+            "quant_type": "w4a8",
+            "activation": "silu",
+            "use_shuffle": 1,
+        }
+    ]
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
 
-    x = torch.zeros(3, 2, dtype=torch.float16)
-    topk_weights = torch.ones(3, 1, dtype=torch.float16)
-    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
-    result = method.apply(layer, x, topk_weights, topk_ids, None)
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_explicit_triton_prepares_only_vllm_weights(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a8_moe",
+        lambda *args: pytest.fail("explicit Triton must not prewarm AITER"),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            moe_backend="triton",
+            experts_per_token=1,
+            hidden_dim=4,
+            in_dtype=torch.float16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+                dtype=torch.uint8,
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    fallback_w1, fallback_w2 = (
+        layer.w13_weight._hcu_vllm_w4a8_fallback_weights
+    )
+    assert fallback_w1.shape == (1, 4, 4)
+    assert fallback_w2.shape == (1, 4, 2)
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_unsupported_m1_does_not_expand_weights_at_load(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **_: (False, None),
+        ),
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            experts_per_token=1,
+            hidden_dim=4,
+            in_dtype=torch.float16,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+                dtype=torch.uint8,
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w2_weight=torch.nn.Parameter(
+            torch.tensor(
+                [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+            ).view(torch.int8),
+            requires_grad=False,
+        ),
+        w13_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+        w2_weight_scale=torch.nn.Parameter(
+            torch.ones(1, 4, 1), requires_grad=False
+        ),
+    )
+
+    method.process_weights_after_loading(layer)
+
+    assert not hasattr(layer.w13_weight, "_hcu_aiter_moe_m1_supported")
+    assert not hasattr(layer.w13_weight, "_hcu_vllm_w4a8_fallback_weights")
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_runtime_rechecks_actual_m_after_m1_miss(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: dict[str, object] = {}
+    selected = SimpleNamespace(
+        quant_type="w4a8",
+        solution_type="moe_c",
+        need_shuffle=False,
+        need_shuffle_scale=False,
+    )
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        calls["selector"] = kwargs
+        return True, selected
+
+    def aiter_moe(**kwargs: object):
+        calls["execute"] = kwargs
+        return kwargs["hidden_states"] + 1
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+            aiter_moe=aiter_moe,
+        ),
+    )
+    x = torch.zeros(3, 4, dtype=torch.bfloat16)
+    topk_weights = torch.ones(3, 2, dtype=torch.float32)
+    topk_ids = torch.zeros(3, 2, dtype=torch.int32)
+    w1 = torch.zeros(2, 8, 2, dtype=torch.int8)
+    w2 = torch.zeros(2, 4, 2, dtype=torch.int8)
+    w1._hcu_aiter_moe_m1_supported = False
+    w1_scale = torch.full((2, 8, 1), 16.0)
+    w2_scale = torch.full((2, 4, 1), 16.0)
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=2),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=w1,
+        w2_weight=w2,
+        global_num_experts=2,
+        _expert_map=None,
+        expert_mask=None,
+    )
+
+    result = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
 
     torch.testing.assert_close(result, x + 1)
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["args"][:4] == (
-        x,
-        layer.w13_weight,
-        layer.w2_weight,
-        topk_weights,
+    assert calls["selector"] == {
+        "M": 3,
+        "E": 2,
+        "N1": 8,
+        "N2": 4,
+        "K": 4,
+        "top_k": 2,
+        "block_size": 0,
+        "dtype": torch.bfloat16,
+        "quant_type": "w4a8",
+        "activation": "silu",
+        "use_shuffle": 1,
+    }
+    execute = calls["execute"]
+    assert execute["moe_config"] is selected
+    assert execute["w1"] is w1
+    assert execute["w2"] is w2
+    assert execute["w1_scale"] is w1_scale
+    assert execute["w2_scale"] is w2_scale
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_actual_m_no_config_uses_cached_selection_and_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe import fused_moe
+
+    calls: list[dict[str, object]] = []
+    selector_calls: list[int] = []
+
+    class MoeQuantType:
+        W4A8 = "w4a8"
+
+    def get_config(**kwargs: object):
+        selector_calls.append(int(kwargs["M"]))
+        return False, None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=get_config,
+        ),
     )
-    assert call["args"][4] is topk_ids
-    kwargs = call["kwargs"]
-    assert kwargs["output_dtype"] is x.dtype
-    assert kwargs["use_int4_w4a8"] is True
+
+    def fused_experts_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        *,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=False,
+        global_num_experts=-1,
+        expert_map=None,
+        w1_scale=None,
+        w2_scale=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    ):
+        args = (hidden_states, w1, w2, topk_weights, topk_ids)
+        kwargs = {
+            "activation": activation,
+            "apply_router_weight_on_input": apply_router_weight_on_input,
+            "use_fp8_w8a8": use_fp8_w8a8,
+            "use_int8_w8a8": use_int8_w8a8,
+            "use_int8_w8a16": use_int8_w8a16,
+            "use_int4_w4a16": use_int4_w4a16,
+            "per_channel_quant": per_channel_quant,
+            "global_num_experts": global_num_experts,
+            "expert_map": expert_map,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "a1_scale": a1_scale,
+            "a2_scale": a2_scale,
+            "block_shape": block_shape,
+        }
+        calls.append({"args": args, "kwargs": kwargs})
+        return hidden_states + 1
+
+    monkeypatch.setattr(fused_moe, "fused_experts_impl", fused_experts_impl)
+    packed_w1 = torch.tensor(
+        [[[0x8F, 0x70], [0x1E, 0xA5], [0x70, 0x8F], [0xA5, 0x1E]]],
+        dtype=torch.uint8,
+    ).view(torch.int8)
+    packed_w2 = torch.tensor(
+        [[[0x8F], [0x70], [0x1E], [0xA5]]], dtype=torch.uint8
+    ).view(torch.int8)
+    method = SimpleNamespace(
+        moe=SimpleNamespace(num_experts=1),
+        moe_quant_config=SimpleNamespace(
+            w1_scale=torch.full((1, 4, 1), 16.0),
+            w2_scale=torch.full((1, 4, 1), 16.0),
+            a1_scale=None,
+            a2_scale=None,
+        ),
+    )
+    layer = SimpleNamespace(
+        w13_weight=packed_w1,
+        w2_weight=packed_w2,
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+    )
+    x = torch.zeros(2, 4, dtype=torch.float16)
+    topk_weights = torch.ones(2, 1, dtype=torch.float32)
+    topk_ids = torch.zeros(2, 1, dtype=torch.int32)
+
+    first = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
+    second = compressed_tensors_moe_runtime.apply_aiter_w4a8_moe(
+        method, layer, x, topk_weights, topk_ids
+    )
+
+    torch.testing.assert_close(first, x + 1)
+    torch.testing.assert_close(second, x + 1)
+    assert selector_calls == [2]
+    assert len(calls) == 2
+    first_args = calls[0]["args"]
+    second_args = calls[1]["args"]
+    assert first_args[1] is not second_args[1]
+    assert first_args[2] is not second_args[2]
+    torch.testing.assert_close(
+        first_args[1],
+        torch.tensor(
+            [[
+                [-8, -1, 7, 0],
+                [1, -2, -6, 5],
+                [7, 0, -8, -1],
+                [-6, 5, 1, -2],
+            ]],
+            dtype=torch.int8,
+        ),
+    )
+    torch.testing.assert_close(
+        first_args[2],
+        torch.tensor(
+            [[[-8, -1], [7, 0], [1, -2], [-6, 5]]], dtype=torch.int8
+        ),
+    )
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["use_int8_w8a8"] is True
+    assert kwargs["use_int4_w4a16"] is False
     assert kwargs["per_channel_quant"] is True
-    assert kwargs["global_num_experts"] == 2
-    assert kwargs["expert_map"] is None
-    assert kwargs["w1_scale"] is layer.w13_weight_scale
-    assert kwargs["w2_scale"] is layer.w2_weight_scale
-    assert kwargs["activation"] == "silu"
-    assert kwargs["is_gated"] is True
+
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_explicit_triton_runtime_never_selects_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.model_executor.layers.fused_moe import fused_moe
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "select_aiter_moe_config",
+        lambda *args, **kwargs: pytest.fail(
+            "explicit Triton must not query the AITER selector"
+        ),
+    )
+    expected = torch.full((2, 4), 3.0, dtype=torch.float16)
+    monkeypatch.setattr(
+        fused_moe,
+        "fused_experts_impl",
+        lambda *args, **kwargs: expected,
+    )
+    method = slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod(
+        quant_config=object(),
+        moe=SimpleNamespace(
+            moe_backend="triton",
+            hidden_dim=4,
+            activation=SimpleNamespace(value="silu"),
+            num_experts=1,
+        ),
+    )
+    method.moe_quant_config = SimpleNamespace(
+        w1_scale=torch.full((1, 4, 1), 16.0),
+        w2_scale=torch.full((1, 4, 1), 16.0),
+        a1_scale=None,
+        a2_scale=None,
+    )
+    layer = SimpleNamespace(
+        w13_weight=torch.zeros((1, 4, 2), dtype=torch.int8),
+        w2_weight=torch.zeros((1, 4, 1), dtype=torch.int8),
+        global_num_experts=1,
+        _expert_map=None,
+        expert_mask=None,
+    )
+    x = torch.zeros((2, 4), dtype=torch.float16)
+
+    actual = method.apply(
+        layer,
+        x,
+        torch.ones((2, 1), dtype=torch.float32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        None,
+        None,
+    )
+
+    assert actual is expected
 
 
 @pytest.mark.hcu
 def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
-    monkeypatch: pytest.MonkeyPatch,
 ):
     from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
 
@@ -2847,19 +3977,40 @@ def test_slimquant_w4a8_apply_fails_closed_for_unsupported_inputs(
     topk_ids = torch.zeros(3, 1, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="rank-2 hidden states"):
-        method.apply(layer, x.unsqueeze(0), topk_weights, topk_ids, None)
-    with pytest.raises(ValueError, match="shared_experts_input"):
-        method.apply(layer, x, topk_weights, topk_ids, x)
+        method.apply(layer, x.unsqueeze(0), topk_weights, topk_ids, None, None)
     with pytest.raises(ValueError, match="same shape"):
-        method.apply(layer, x, topk_weights[:, :0], topk_ids, None)
+        method.apply(layer, x, topk_weights[:, :0], topk_ids, None, None)
     with pytest.raises(ValueError, match="same token count"):
-        method.apply(layer, x, topk_weights[:2], topk_ids[:2], None)
+        method.apply(layer, x, topk_weights[:2], topk_ids[:2], None, None)
 
-    import_error = ImportError("missing aiter Triton fused MoE")
-    monkeypatch.setattr(slimquant_w4a8, "aiter_triton_fused_moe", None)
-    monkeypatch.setattr(slimquant_w4a8, "_AITER_TRITON_IMPORT_ERROR", import_error)
-    with pytest.raises(RuntimeError, match="requires aiter.ops.triton.fused_moe"):
-        method.apply(layer, x, topk_weights, topk_ids, None)
+
+@pytest.mark.hcu
+def test_slimquant_w4a8_apply_accepts_runner_owned_shared_experts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization import slimquant_w4a8
+
+    method = object.__new__(slimquant_w4a8.SlimQuantW4A8Int8AiterMoEMethod)
+    layer = SimpleNamespace()
+    x = torch.zeros(3, 2, dtype=torch.float16)
+    topk_weights = torch.ones(3, 1, dtype=torch.float16)
+    topk_ids = torch.zeros(3, 1, dtype=torch.int32)
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "apply_aiter_w4a8_moe",
+        lambda *args: args[2],
+    )
+
+    result = method.apply(
+        layer,
+        x,
+        topk_weights,
+        topk_ids,
+        shared_experts=object(),
+        shared_experts_input=x,
+    )
+
+    assert result is x
 
 
 def _fake_moe_fp8_module():
@@ -3004,6 +4155,37 @@ def test_moe_fp8_explicit_aiter_ignores_legacy_environment_half_states(
     assert len(method_class.init_calls) == 1
 
 
+def test_moe_fp8_aiter_prewarms_m1_during_weight_loading(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _fake_moe_fp8_module()
+    method_class = module.CompressedTensorsW8A8Fp8MoEMethod
+    method_class.selected_backend = "AITER"
+    patch_compressed_tensors_moe_w8a8_fp8.apply_to_module(module)
+    method = method_class(
+        *_channel_fp8_moe_args(module),
+        SimpleNamespace(moe_backend="aiter"),
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=True,
+        use_int8_w8a8=False,
+        block_shape=None,
+    )
+    method.moe_quant_config = quant_config
+    calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_quantized_moe",
+        lambda layer, moe, config: calls.append((layer, moe, config)),
+    )
+    layer = _fp8_moe_layer()
+
+    method.process_weights_after_loading(layer)
+
+    assert layer.upstream_processed is True
+    assert calls == [(layer, method.moe, quant_config)]
+
+
 def test_moe_fp8_explicit_deepgemm_accepts_hcu_oracle_selection():
     module = _fake_moe_fp8_module()
     method_class = module.CompressedTensorsW8A8Fp8MoEMethod
@@ -3061,7 +4243,7 @@ def test_moe_fp8_non_channel_routes_delegate_target_without_triton_policy(
     assert len(method_class.init_calls) == 1
 
 
-def test_moe_fp8_aiter_config_is_layer_aware_and_cached(
+def test_moe_fp8_aiter_route_is_layer_aware_and_cached(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[dict[str, object]] = []
@@ -3071,7 +4253,12 @@ def test_moe_fp8_aiter_config_is_layer_aware_and_cached(
 
     def get_config(**kwargs):
         calls.append(kwargs)
-        return True, SimpleNamespace(solution_type="ASM", serial=len(calls))
+        return True, SimpleNamespace(
+            quant_type=kwargs["quant_type"],
+            solution_type="MOE_C",
+            need_shuffle=False,
+            config={"serial": len(calls)},
+        )
 
     monkeypatch.setitem(
         sys.modules,
@@ -3080,31 +4267,43 @@ def test_moe_fp8_aiter_config_is_layer_aware_and_cached(
             "aiter.moe",
             MoeQuantType=MoeQuantType,
             get_aiter_moe_config=get_config,
+            aiter_moe=lambda **kwargs: kwargs["hidden_states"].clone(),
         ),
     )
-    method = SimpleNamespace(_hcu_aiter_moe_config_cache={})
+    method = SimpleNamespace(moe=object())
     x = torch.ones(2, 4)
     ids = torch.zeros(2, 2, dtype=torch.int64)
     first_layer = _fp8_moe_layer()
-    first = compressed_tensors_moe_runtime.get_aiter_w8a8_runtime_config(
-        method, first_layer, x, ids
-    )
-    again = compressed_tensors_moe_runtime.get_aiter_w8a8_runtime_config(
-        method, first_layer, x, ids
-    )
-    second = compressed_tensors_moe_runtime.get_aiter_w8a8_runtime_config(
-        method, _fp8_moe_layer(), x, ids
-    )
-    assert first is again and first is not second
+    weights = torch.ones(2, 2)
+
+    def run(layer: object):
+        return compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            method,
+            layer,
+            x,
+            weights,
+            ids,
+            None,
+            None,
+        )
+
+    run(first_layer)
+    run(first_layer)
+    run(_fp8_moe_layer())
     assert len(calls) == 2
     assert calls[0]["quant_type"] == "fp8_w8a8"
     assert calls[0]["M"] == 2 and calls[0]["top_k"] == 2
+    assert calls[0]["use_shuffle"] == 1
 
 
-def test_moe_fp8_uses_workspace_aiter_shuffle_and_invalidates_on_weight_change(
+def test_moe_fp8_uses_unified_shuffle_cache_and_invalidates_on_weight_change(
     monkeypatch: pytest.MonkeyPatch,
 ):
     calls: list[str] = []
+    kernel_weights: list[torch.Tensor] = []
+
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
 
     def shuffle_weights(w1, w2, config):
         assert config is moe_config
@@ -3116,28 +4315,48 @@ def test_moe_fp8_uses_workspace_aiter_shuffle_and_invalidates_on_weight_change(
         quant_type="fp8_w8a8",
         solution_type="moe_c",
         need_shuffle=True,
+        config={},
     )
+
+    def execute(**kwargs: object):
+        kernel_weights.append(kwargs["w1"])
+        return kwargs["hidden_states"].clone()
+
     monkeypatch.setitem(
         sys.modules,
         "aiter.moe",
         _module(
             "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **kwargs: (True, moe_config),
             aiter_moe_shfl_weight=shuffle_weights,
+            aiter_moe=execute,
         ),
     )
     layer = _fp8_moe_layer()
-    first = compressed_tensors_moe_runtime.get_aiter_weights_for_solution(
-        layer, moe_config
-    )
-    again = compressed_tensors_moe_runtime.get_aiter_weights_for_solution(
-        layer, moe_config
-    )
-    assert first[0] is again[0] and calls == ["w1", "w2"]
+    method = SimpleNamespace(moe=object())
+    x = torch.ones(2, 4)
+    weights = torch.ones(2, 2)
+    ids = torch.zeros(2, 2, dtype=torch.int64)
+
+    def run():
+        return compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            method,
+            layer,
+            x,
+            weights,
+            ids,
+            None,
+            None,
+        )
+
+    run()
+    run()
+    assert kernel_weights[0] is kernel_weights[1]
+    assert calls == ["w1", "w2"]
     layer.w13_weight.add_(1)
-    refreshed = compressed_tensors_moe_runtime.get_aiter_weights_for_solution(
-        layer, moe_config
-    )
-    assert refreshed[0] is not first[0]
+    run()
+    assert kernel_weights[2] is not kernel_weights[1]
     assert calls == ["w1", "w2", "w1", "w2"]
 
 
@@ -3211,6 +4430,107 @@ def test_moe_fp8_aiter_path_accepts_v0251_shared_expert_contract(
         compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
             method, layer, x, weights, ids, None, None
         )
+
+
+def test_moe_fp8_no_solution_falls_back_to_vllm_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+        ),
+    )
+    expected = torch.full((2, 4), 8.0)
+    fallback_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+
+    def fallback(*args: object, **kwargs: object):
+        fallback_calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(fused_moe_module, "fused_experts_impl", fallback)
+    layer = _fp8_moe_layer()
+    x = torch.ones(2, 4)
+
+    actual = compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+        SimpleNamespace(moe=object()),
+        layer,
+        x,
+        torch.ones(2, 2),
+        torch.zeros(2, 2, dtype=torch.int64),
+        None,
+        None,
+    )
+
+    assert actual is expected
+    assert fallback_calls[0][0][0] is x
+    assert fallback_calls[0][0][1] is layer.w13_weight
+    assert fallback_calls[0][0][2] is layer.w2_weight
+    assert fallback_calls[0][1]["use_fp8_w8a8"] is True
+    assert fallback_calls[0][1]["per_channel_quant"] is True
+
+
+def test_moe_fp8_config_fault_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+
+    def config_fault(**kwargs: object):
+        raise RuntimeError("aiter config fault")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=config_fault,
+        ),
+    )
+    fallback_calls: list[object] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="aiter config fault"):
+        compressed_tensors_moe_runtime.apply_aiter_w8a8_fp8_moe(
+            SimpleNamespace(moe=object()),
+            _fp8_moe_layer(),
+            torch.ones(2, 4),
+            torch.ones(2, 2),
+            torch.zeros(2, 2, dtype=torch.int64),
+            None,
+            None,
+        )
+    assert fallback_calls == []
+
+
+def test_moe_fp8_runtime_owns_no_duplicate_aiter_selector_helpers():
+    assert not hasattr(
+        compressed_tensors_moe_runtime,
+        "get_aiter_w8a8_runtime_config",
+    )
+    assert not hasattr(
+        compressed_tensors_moe_runtime,
+        "get_aiter_weights_for_solution",
+    )
 
 
 @pytest.mark.parametrize(
@@ -3306,13 +4626,15 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
     assert config_calls[0]["M"] == 2
     assert config_calls[0]["E"] == 3
     assert config_calls[0]["top_k"] == 2
+    assert config_calls[0]["use_shuffle"] == 1
     call = kernel_calls[0]
     assert call["hidden_states"] is hidden_states
     assert call["w1"] is w1 and call["w2"] is w2
     assert call["w1_scale"] is w1_scale and call["w2_scale"] is w2_scale
     assert call["a1_scale"] is a1q_scale
     torch.testing.assert_close(
-        call["expert_map"], torch.ones_like(expert_map, dtype=torch.int32)
+        call["expert_map"],
+        torch.tensor([1, 1, 1, 0], dtype=torch.int32),
     )
     assert call["global_num_experts"] == 3
     assert call["inplace"] is False
@@ -3329,7 +4651,7 @@ def test_quantized_aiter_runtime_selects_exact_quant_type(
 @pytest.mark.parametrize(
     ("solution_type", "expected_map"),
     [
-        ("ASM", [0, 1, 1, 0]),
+        ("ASM", [1, 0, 1, 0, 0]),
         ("MOE_C", [-1, 0, 1, -1]),
     ],
 )
@@ -3397,6 +4719,8 @@ def test_quantized_aiter_runtime_converts_only_asm_ep_map_to_binary_mask(
     )
 
     expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int64)
+    expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = expert_map
     quant_config = SimpleNamespace(
         use_fp8_w8a8=use_fp8,
         use_int8_w8a8=use_int8,
@@ -3417,7 +4741,7 @@ def test_quantized_aiter_runtime_converts_only_asm_ep_map_to_binary_mask(
         vllm_moe_config=SimpleNamespace(num_experts=4),
         activation=SimpleNamespace(value="silu"),
         apply_router_weight_on_input=False,
-        expert_map=expert_map,
+        expert_map=expert_mask,
         quant_config=quant_config,
     )
 
@@ -3429,7 +4753,9 @@ def test_quantized_aiter_runtime_converts_only_asm_ep_map_to_binary_mask(
         passed_map.cpu(),
         torch.tensor(expected_map, dtype=passed_map.dtype),
     )
-    if solution_type == "MOE_C":
+    if solution_type == "ASM":
+        assert passed_map is expert_mask
+    else:
         assert passed_map is expert_map
 
 
@@ -3485,6 +4811,7 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
     solution_type: str,
     expected: str,
 ):
+    observed_quantizers: list[str] = []
     class MoeQuantType:
         FP8_W8A8 = "fp8_w8a8"
         W8A8 = "int8_w8a8"
@@ -3542,7 +4869,10 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
         )
 
     def aiter_moe(**kwargs):
-        return asm_module.per_token_quant_int8(kwargs["hidden_states"])
+        observed_quantizers.append(
+            asm_module.per_token_quant_int8(kwargs["hidden_states"])
+        )
+        return kwargs["hidden_states"].clone()
 
     monkeypatch.setitem(
         sys.modules,
@@ -3580,7 +4910,8 @@ def test_quantized_aiter_runtime_scopes_boltops_quant_to_int8_asm(
         quant_config=quant_config,
     )
 
-    assert output == expected
+    torch.testing.assert_close(output, hidden_states)
+    assert observed_quantizers == [expected]
 
 
 @pytest.mark.parametrize(
@@ -3828,7 +5159,6 @@ def test_quantized_aiter_runtime_caches_config_and_invalidates_shuffled_weights(
         ("router_weight", "apply_router_weight_on_input=True"),
         ("block_quant", "channel/token W8A8"),
         ("ambiguous_quant", "exactly one FP8-W8A8 or INT8-W8A8"),
-        ("no_solution", "found no backend config"),
     ],
 )
 def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
@@ -3841,8 +5171,6 @@ def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
         W8A8 = "int8_w8a8"
 
     def get_config(**kwargs):
-        if invalid_case == "no_solution":
-            return False, None
         return True, SimpleNamespace(
             quant_type=kwargs["quant_type"],
             solution_type="asm",
@@ -3899,6 +5227,128 @@ def test_quantized_aiter_runtime_rejects_invalid_explicit_contracts(
             expert_map=None,
             quant_config=quant_config,
         )
+
+
+def test_quantized_aiter_runtime_no_solution_falls_back_to_vllm_triton(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        FP8_W8A8 = "fp8_w8a8"
+        W8A8 = "int8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+            aiter_moe=lambda **kwargs: pytest.fail(
+                "no-solution must not execute AITER"
+            ),
+        ),
+    )
+    expected = torch.full((2, 4), 6.0)
+    fallback_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+
+    def fallback(*args: object, **kwargs: object):
+        fallback_calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(fused_moe_module, "fused_experts_impl", fallback)
+    hidden_states = torch.ones((2, 4), dtype=torch.bfloat16)
+    w1 = torch.zeros((3, 8, 4), dtype=torch.int8)
+    w2 = torch.zeros((3, 4, 4), dtype=torch.int8)
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    native_expert_map = torch.tensor([0, -1, 1], dtype=torch.int32)
+    expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
+
+    actual = compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weights=torch.ones((2, 2)),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+        vllm_moe_config=SimpleNamespace(num_experts=3),
+        activation=SimpleNamespace(value="silu"),
+        apply_router_weight_on_input=False,
+        expert_map=expert_mask,
+        quant_config=quant_config,
+    )
+
+    assert actual is expected
+    assert fallback_calls[0][0][1] is w1
+    assert fallback_calls[0][0][2] is w2
+    assert fallback_calls[0][1]["use_int8_w8a8"] is True
+    assert fallback_calls[0][1]["per_channel_quant"] is True
+    assert fallback_calls[0][1]["expert_map"] is native_expert_map
+
+
+def test_quantized_aiter_runtime_config_fault_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class MoeQuantType:
+        W8A8 = "int8_w8a8"
+
+    def config_fault(**kwargs: object):
+        raise RuntimeError("aiter config fault")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=config_fault,
+        ),
+    )
+    fallback_calls: list[object] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        block_shape=None,
+    )
+
+    with pytest.raises(RuntimeError, match="aiter config fault"):
+        compressed_tensors_moe_runtime.apply_aiter_quantized_moe(
+            hidden_states=torch.ones((2, 4), dtype=torch.bfloat16),
+            w1=torch.zeros((3, 8, 4), dtype=torch.int8),
+            w2=torch.zeros((3, 4, 4), dtype=torch.int8),
+            topk_weights=torch.ones((2, 2)),
+            topk_ids=torch.zeros((2, 2), dtype=torch.int64),
+            vllm_moe_config=SimpleNamespace(num_experts=3),
+            activation=SimpleNamespace(value="silu"),
+            apply_router_weight_on_input=False,
+            expert_map=None,
+            quant_config=quant_config,
+        )
+    assert fallback_calls == []
 
 
 def test_moe_fp8_hcu_deepgemm_restores_layouts_after_kernel_recreation(
@@ -4109,6 +5559,15 @@ def test_moe_wna16_quant_config_requires_registered_qzeros(
     )
     patch_compressed_tensors_moe_wna16.apply_to_module(module)
     method = _wna16_method(module, gated=True)
+    prewarm_calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_w4a16_moe",
+        lambda owner, layer, config: prewarm_calls.append(
+            (owner, layer, config)
+        ),
+        raising=False,
+    )
     with pytest.raises(
         compressed_tensors_moe_runtime.HcuCompressedTensorsMoeError,
         match="w13_weight_scale",
@@ -4122,6 +5581,7 @@ def test_moe_wna16_quant_config_requires_registered_qzeros(
     assert config.w2_zp is layer.w2_qzeros
     assert config.block_shape == [0, 4]
     assert len(config_calls) == 1
+    assert prewarm_calls == [(method, layer, config)]
 
     invalid = _wna16_method(module, gated=True, num_bits=8)
     invalid_layer = torch.nn.Module()
@@ -4515,6 +5975,212 @@ print("SLIMQUANT_PREPATCH_IMPORT_OK")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SLIMQUANT_PREPATCH_IMPORT_OK" in result.stdout
+
+
+def test_marlin_aiter_moe_no_solution_uses_native_triton_not_lmslim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    method_class = marlin.CompressedTensorsW8A8Int8MarlinMoEMethod
+    assert not hasattr(method_class, "_get_aiter_moe_runtime_config")
+    assert not hasattr(method_class, "_get_aiter_weights_for_solution")
+    method = object.__new__(method_class)
+    method.moe = SimpleNamespace(num_experts=3)
+    method.moe_quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        w1_zp=None,
+        w2_zp=None,
+        a1_scale=None,
+        a2_scale=None,
+        block_shape=None,
+    )
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
+    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+
+    class MoeQuantType:
+        W8A8 = "int8_w8a8"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=lambda **kwargs: (False, None),
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+        _module(
+            "lmslim.layers.fused_moe.fuse_moe_int8_marlin",
+            fused_experts_impl_int8_marlin=lambda **kwargs: pytest.fail(
+                "AITER no-solution must use vLLM Triton, not LMSlim"
+            ),
+        ),
+    )
+    expected = torch.full((2, 4), 4.0)
+    fallback_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+
+    def fallback(*args: object, **kwargs: object):
+        fallback_calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(fused_moe_module, "fused_experts_impl", fallback)
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
+    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
+
+    actual = method.apply(
+        layer,
+        torch.ones((2, 4), dtype=torch.bfloat16),
+        torch.ones((2, 2)),
+        torch.zeros((2, 2), dtype=torch.int64),
+        None,
+        None,
+    )
+
+    assert actual is expected
+    assert fallback_calls[0][1]["use_int8_w8a8"] is True
+
+
+def test_marlin_explicit_triton_backend_bypasses_aiter_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    _install_fake_vllm_envs(
+        monkeypatch,
+        VLLM_ROCM_USE_AITER=True,
+        VLLM_ROCM_USE_AITER_MOE=True,
+    )
+
+    assert not marlin._is_hcu_aiter_w8a8_moe_requested(
+        SimpleNamespace(moe_backend="triton")
+    )
+
+
+def test_marlin_aiter_moe_prewarms_m1_during_weight_loading(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    method.moe = SimpleNamespace(
+        num_experts=3,
+        experts_per_token=2,
+        in_dtype=torch.bfloat16,
+        activation=SimpleNamespace(value="silu"),
+    )
+    quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        block_shape=None,
+    )
+    method.get_fused_moe_quant_config = lambda unused_layer: quant_config
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
+    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+    calls: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        compressed_tensors_moe_runtime,
+        "prewarm_aiter_quantized_moe",
+        lambda layer, moe, config: calls.append((layer, moe, config)),
+        raising=False,
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
+    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
+
+    method.process_weights_after_loading(layer)
+
+    assert method.moe_quant_config is quant_config
+    assert calls == [(layer, method.moe, quant_config)]
+
+
+def test_marlin_aiter_moe_config_fault_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_hcu.model_executor.layers.quantization.compressed_tensors import (
+        compressed_tensors_moe_marlin as marlin,
+    )
+
+    method = object.__new__(marlin.CompressedTensorsW8A8Int8MarlinMoEMethod)
+    method.moe = SimpleNamespace(num_experts=3)
+    method.moe_quant_config = SimpleNamespace(
+        use_fp8_w8a8=False,
+        use_int8_w8a8=True,
+        w1_scale=torch.ones((3, 8, 1)),
+        w2_scale=torch.ones((3, 4, 1)),
+        block_shape=None,
+    )
+    monkeypatch.setattr(
+        marlin,
+        "_is_hcu_aiter_w8a8_moe_requested",
+        lambda _moe=None: True,
+    )
+    monkeypatch.setattr(marlin.rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+
+    class MoeQuantType:
+        W8A8 = "int8_w8a8"
+
+    def config_fault(**kwargs: object):
+        raise RuntimeError("aiter config fault")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.moe",
+        _module(
+            "aiter.moe",
+            MoeQuantType=MoeQuantType,
+            get_aiter_moe_config=config_fault,
+        ),
+    )
+    fallback_calls: list[object] = []
+    fused_moe_module = __import__(
+        "vllm.model_executor.layers.fused_moe.fused_moe",
+        fromlist=["fused_experts_impl"],
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "fused_experts_impl",
+        lambda *args, **kwargs: fallback_calls.append((args, kwargs)),
+    )
+    layer = _fp8_moe_layer()
+    layer.w13_weight = torch.zeros((3, 8, 4), dtype=torch.int8)
+    layer.w2_weight = torch.zeros((3, 4, 4), dtype=torch.int8)
+
+    with pytest.raises(RuntimeError, match="aiter config fault"):
+        method.apply(
+            layer,
+            torch.ones((2, 4), dtype=torch.bfloat16),
+            torch.ones((2, 2)),
+            torch.zeros((2, 2), dtype=torch.int64),
+            None,
+            None,
+        )
+    assert fallback_calls == []
 
 
 @pytest.mark.parametrize("is_rocm", [False, True])

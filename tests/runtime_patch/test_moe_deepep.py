@@ -1086,12 +1086,14 @@ def test_fused_moe_aiter_feature_gate_and_obsolete_contract(
     monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
     monkeypatch.setitem(sys.modules, "aiter", ModuleType("aiter"))
     monkeypatch.delitem(sys.modules, "aiter.moe", raising=False)
-    with pytest.raises(RuntimeError, match="aiter.moe API is unavailable"):
+    with pytest.raises(ModuleNotFoundError):
         module.fused_experts_impl(*arguments)
 
 
+@pytest.mark.parametrize("solution_type", ["asm", "moe_c", "triton", "ck"])
 def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     monkeypatch: pytest.MonkeyPatch,
+    solution_type: str,
 ):
     parameter_names = (
         "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
@@ -1122,9 +1124,10 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     calls: dict[str, object] = {}
     moe_config = SimpleNamespace(
         quant_type="w4a16",
-        solution_type="moe_c",
+        solution_type=solution_type,
         need_shuffle=False,
         need_shuffle_scale=True,
+        config={},
     )
 
     class MoeQuantType:
@@ -1142,9 +1145,11 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
         calls["scale"] = (scale1, scale2)
         return scale1 + 1, scale2 + 2
 
+    expected = torch.ones((1, 2), dtype=torch.bfloat16)
+
     def aiter_moe(**kwargs):
         calls["moe"] = kwargs
-        return "workspace-aiter"
+        return expected
 
     monkeypatch.setitem(
         sys.modules,
@@ -1166,19 +1171,111 @@ def test_fused_moe_w4a16_uses_workspace_aiter_public_contract(
     topk_ids = torch.zeros((1, 1), dtype=torch.int32)
     w1_scale = torch.ones((1, 4, 1))
     w2_scale = torch.ones((1, 2, 1))
+    native_expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
     result = module.fused_experts_impl(
         hidden, w1, w2, topk_weights, topk_ids, "silu", False, False,
-        False, False, True, None, False, 1, None, w1_scale, w2_scale,
+        False, False, True, None, False, 4, expert_mask, w1_scale, w2_scale,
         None, None, None, None, [128, 128], None, None,
     )
 
-    assert result == "workspace-aiter"
+    assert result is expected
     assert calls["config"]["N2"] == w2.shape[1]
+    assert calls["config"]["use_shuffle"] == 1
+    assert "spec_sol_type" not in calls["config"]
     assert calls["moe"]["moe_config"] is moe_config
     assert calls["moe"]["w1"] is w1
     torch.testing.assert_close(calls["moe"]["w1_scale"], w1_scale + 1)
     torch.testing.assert_close(calls["moe"]["w2_scale"], w2_scale + 2)
     assert calls["moe"]["use_weight_shuffle"] is False
+    expected_expert_map = (
+        expert_mask if solution_type == "asm" else native_expert_map
+    )
+    assert calls["moe"]["expert_map"] is expected_expert_map
+
+
+def test_fused_moe_w4a16_fallback_is_only_explicit_no_solution(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    parameter_names = (
+        "hidden_states", "w1", "w2", "topk_weights", "topk_ids",
+        "activation", "apply_router_weight_on_input", "use_fp8_w8a8",
+        "use_int8_w8a8", "use_int8_w8a16", "use_int4_w4a16",
+        "ocp_mx_scheme", "per_channel_quant", "global_num_experts",
+        "expert_map", "w1_scale", "w2_scale", "w1_zp", "w2_zp",
+        "a1_scale", "a2_scale", "block_shape", "w1_bias", "w2_bias",
+    )
+    namespace: dict[str, object] = {"original_calls": []}
+    exec(
+        "def fused_experts_impl("
+        + ", ".join(parameter_names)
+        + "):\n"
+        + "    original_calls.append((w1, w2, w1_scale, w2_scale, expert_map))\n"
+        + "    return 'official'\n",
+        namespace,
+    )
+    module = _module(
+        patch_fused_moe.TARGET_MODULE,
+        torch=torch,
+        fused_experts_impl=namespace["fused_experts_impl"],
+    )
+    assert patch_fused_moe.apply_to_module(module) is True
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_AITER_W4A16_MOE", True)
+
+    class MoeQuantType:
+        W4A16 = "w4a16"
+
+    aiter_module = _module(
+        "aiter.moe",
+        MoeQuantType=MoeQuantType,
+        get_aiter_moe_config=lambda **kwargs: (False, None),
+        aiter_moe=lambda **kwargs: pytest.fail(
+            "no-solution must not execute AITER"
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "aiter.moe", aiter_module)
+    hidden = torch.zeros((1, 2), dtype=torch.bfloat16)
+    w1 = torch.zeros((1, 4, 2), dtype=torch.int8)
+    w2 = torch.zeros((1, 2, 2), dtype=torch.int8)
+    topk_weights = torch.ones((1, 1))
+    topk_ids = torch.zeros((1, 1), dtype=torch.int32)
+    w1_scale = torch.ones((1, 4, 1))
+    w2_scale = torch.ones((1, 2, 1))
+    native_expert_map = torch.tensor([-1, 0, 1, -1], dtype=torch.int32)
+    expert_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int32)
+    expert_mask._vllm_hcu_native_expert_map = native_expert_map
+    arguments = (
+        hidden, w1, w2, topk_weights, topk_ids, "silu", False, False,
+        False, False, True, None, False, 4, expert_mask, w1_scale, w2_scale,
+        None, None, None, None, [128, 128], None, None,
+    )
+
+    assert module.fused_experts_impl(*arguments) == "official"
+    original_calls = namespace["original_calls"]
+    assert len(original_calls) == 1
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            original_calls[0][:4],
+            (w1, w2, w1_scale, w2_scale),
+            strict=True,
+        )
+    )
+    assert original_calls[0][4] is native_expert_map
+
+    def config_fault(**kwargs: object):
+        raise RuntimeError("aiter config fault")
+
+    aiter_module.get_aiter_moe_config = config_fault
+    fault_arguments = list(arguments)
+    fault_arguments[1] = w1.clone()
+    with pytest.raises(RuntimeError, match="aiter config fault"):
+        module.fused_experts_impl(*fault_arguments)
+    assert len(original_calls) == 1
 
 
 def test_modular_method_dimensions_and_prequant_contract():
@@ -1409,6 +1506,12 @@ def test_moe_layer_forward_and_repacked_weight_contract(
             self.layer_name = "model.layers.0.mlp"
             self.expert_mapping = []
             self.official_loads = []
+            self._expert_map = torch.tensor([0, -1, 1, -1], dtype=torch.int32)
+            self.expert_mask = torch.tensor([1, 0, 1, 0, 0], dtype=torch.int32)
+
+        @property
+        def expert_map(self):
+            return self.expert_mask
 
         def _replace_quant_method(self, method):
             self.quant_method = method
@@ -1483,6 +1586,10 @@ def test_moe_layer_forward_and_repacked_weight_contract(
     assert isinstance(experts.quant_method, HcuUnquantizedFusedMoEMethod)
     assert experts.quant_method.moe_quant_config == "official-config"
     assert runner.replaced is experts.quant_method
+    assert experts.expert_map is experts.expert_mask
+    assert (
+        experts.expert_mask._vllm_hcu_native_expert_map is experts._expert_map
+    )
 
     experts._dsv4_channel_deepgemm_repacked = True
     experts.w13_weight = torch.arange(24).reshape(2, 3, 4)
