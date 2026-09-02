@@ -25,7 +25,7 @@ def _require_slimquant_w4a8_hipc_runtime() -> None:
             "m_grouped_w4a8_gemm_nt_contiguous_hipc",
             "m_grouped_w4a8_gemm_nt_masked_hipc",
         ),
-        "lightop": (
+        "lightop.activation": (
             "fuse_silu_mul_quant",
             "fuse_silu_mul_quant_ep",
         ),

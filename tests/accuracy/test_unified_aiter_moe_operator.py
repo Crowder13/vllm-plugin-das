@@ -34,6 +34,9 @@ from tests.accuracy.deepseek_v4_dspark_ops_cases import (
 
 pytestmark = pytest.mark.hcu
 
+
+pytestmark = pytest.mark.hcu
+
 NUMERICAL_LIMITS = {
     "w16a16": {
         "min_reference_rms": 5e-5,

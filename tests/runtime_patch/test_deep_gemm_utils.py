@@ -13,6 +13,27 @@ import pytest
 import torch
 
 
+def _install_categorized_lightop(
+    monkeypatch,
+    *,
+    activation_name: str,
+    activation_kernel,
+    gemm_name: str,
+    gemm_kernel,
+) -> None:
+    lightop = ModuleType("lightop")
+    lightop.__path__ = []
+    activation = ModuleType("lightop.activation")
+    gemm_ops = ModuleType("lightop.gemm_ops")
+    setattr(activation, activation_name, activation_kernel)
+    setattr(gemm_ops, gemm_name, gemm_kernel)
+    lightop.activation = activation
+    lightop.gemm_ops = gemm_ops
+    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    monkeypatch.setitem(sys.modules, "lightop.activation", activation)
+    monkeypatch.setitem(sys.modules, "lightop.gemm_ops", gemm_ops)
+
+
 def _load_permute_function():
     source_path = (
         Path(__file__).parents[2]
@@ -171,16 +192,16 @@ def _run_w8a8_apply(
 
 
 def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
-    deepgemm = ModuleType("deepgemm")
-    deepgemm.m_grouped_i8_gemm_nt_contiguous = lambda *_args: None
-    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
-    lightop = ModuleType("lightop")
-    lightop.m_grouped_w8a8_gemm_nt_contig_asm = lambda *_args: None
-    lightop.fuse_silu_mul_quant = lambda tensor, **kwargs: (
-        kwargs["output"],
-        torch.ones((tensor.shape[0], 1)),
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant",
+        activation_kernel=lambda tensor, **kwargs: (
+            kwargs["output"],
+            torch.ones((tensor.shape[0], 1)),
+        ),
+        gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
+        gemm_kernel=lambda *_args: None,
     )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
 
     hcu = _load_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
@@ -208,27 +229,20 @@ def test_w8a8_apply_skips_alignment_scope_only_on_rocm(monkeypatch):
     assert events == [("scope", 256), "enter", "exit"]
 
 
-def test_w8a8_apply_uses_architecture_aware_deepgemm_contiguous_api(
+def test_w8a8_apply_uses_categorized_lightop_contiguous_api(
     monkeypatch,
 ):
-    lightop = ModuleType("lightop")
-
-    def reject_raw_lightop(*_args):
-        raise AssertionError("raw LightOP contiguous GEMM invoked")
-
-    lightop.m_grouped_w8a8_gemm_nt_contig_asm = reject_raw_lightop
-    lightop.fuse_silu_mul_quant = lambda tensor, **kwargs: (
-        kwargs["output"],
-        torch.ones((tensor.shape[0], 1)),
-    )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
-
     calls: list[tuple[object, ...]] = []
-    deepgemm = ModuleType("deepgemm")
-    deepgemm.m_grouped_i8_gemm_nt_contiguous = (
-        lambda *args: calls.append(args)
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant",
+        activation_kernel=lambda tensor, **kwargs: (
+            kwargs["output"],
+            torch.ones((tensor.shape[0], 1)),
+        ),
+        gemm_name="m_grouped_w8a8_gemm_nt_contig_asm",
+        gemm_kernel=lambda *args: calls.append(args),
     )
-    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
     hcu = _load_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
 
@@ -277,33 +291,20 @@ def _load_batched_deep_gemm_apply():
     return namespace
 
 
-def test_w8a8_batched_apply_uses_masked_int8_deepgemm_api(
+def test_w8a8_batched_apply_uses_categorized_lightop_masked_api(
     monkeypatch,
 ):
-    lightop = ModuleType("lightop")
-
-    def reject_raw_lightop(*_args):
-        raise AssertionError("raw LightOP masked GEMM invoked")
-
-    lightop.m_grouped_w8a8_gemm_nt_masked = reject_raw_lightop
-    lightop.fuse_silu_mul_quant_ep = lambda tensor, _counts: (
-        tensor,
-        torch.ones((*tensor.shape[:-1], 1)),
-    )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
-
     calls: list[tuple[object, ...]] = []
-    deepgemm = ModuleType("deepgemm")
-    deepgemm.__path__ = []
-    deepgemm.m_grouped_i8_gemm_nt_masked = lambda *args: calls.append(args)
-    m_group_gemm = ModuleType("deepgemm.m_group_gemm")
-
-    def reject_w6_api(*_args):
-        raise AssertionError("W6 low-latency masked API invoked")
-
-    m_group_gemm.m_grouped_w8a8_gemm_nt_masked_ll = reject_w6_api
-    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
-    monkeypatch.setitem(sys.modules, "deepgemm.m_group_gemm", m_group_gemm)
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=lambda tensor, _counts: (
+            tensor,
+            torch.ones((*tensor.shape[:-1], 1)),
+        ),
+        gemm_name="m_grouped_w8a8_gemm_nt_masked",
+        gemm_kernel=lambda *args: calls.append(args),
+    )
     hcu = _load_batched_deep_gemm_apply()
     hcu["current_platform"] = SimpleNamespace(is_rocm=lambda: True)
     experts = SimpleNamespace(
@@ -675,7 +676,6 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
 ):
     """The int4 branch must use HIPC masked GEMMs for gate/up and down."""
 
-    lightop = ModuleType("lightop")
     activation_call: dict[str, object] = {}
 
     def quantize(tensor: torch.Tensor, tokens_per_expert: torch.Tensor):
@@ -688,8 +688,13 @@ def test_w4a8_masked_batched_apply_propagates_scales_and_token_counts(
             torch.full((1, 2, 1), 0.5, dtype=torch.float32),
         )
 
-    lightop.fuse_silu_mul_quant_ep = quantize
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=quantize,
+        gemm_name="unused_w4a8_gemm",
+        gemm_kernel=lambda *_args: None,
+    )
 
     gemm_calls: list[tuple[object, ...]] = []
     deepgemm = ModuleType("deepgemm")
@@ -763,11 +768,15 @@ def test_w4a8_masked_empty_dispatch_skips_all_kernels(
 ):
     """An empty LL dispatch must not launch a masked GEMM."""
 
-    lightop = ModuleType("lightop")
-    lightop.fuse_silu_mul_quant_ep = lambda *_args: (_ for _ in ()).throw(
-        AssertionError("empty masked dispatch launched activation")
+    _install_categorized_lightop(
+        monkeypatch,
+        activation_name="fuse_silu_mul_quant_ep",
+        activation_kernel=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("empty masked dispatch launched activation")
+        ),
+        gemm_name="unused_w4a8_gemm",
+        gemm_kernel=lambda *_args: None,
     )
-    monkeypatch.setitem(sys.modules, "lightop", lightop)
     deepgemm = ModuleType("deepgemm")
     deepgemm.__path__ = []
     deepgemm.m_grouped_w4a8_gemm_nt_masked_hipc = lambda *_args: (

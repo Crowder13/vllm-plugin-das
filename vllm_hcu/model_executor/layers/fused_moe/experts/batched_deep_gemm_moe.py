@@ -481,7 +481,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                     "SlimQuant W4A8 masked weights were not packed before apply"
                 )
             from deepgemm import m_grouped_w4a8_gemm_nt_masked_hipc
-            from lightop import fuse_silu_mul_quant_ep
+            from lightop.activation import fuse_silu_mul_quant_ep
 
             m_grouped_w4a8_gemm_nt_masked_hipc(
                 (a1q, a1q_scale),
@@ -506,10 +506,10 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 raise ValueError(
                     "HCU Channel INT8 batched DeepGEMM supports only SiLU activation"
                 )
-            from deepgemm import m_grouped_i8_gemm_nt_masked
-            from lightop import fuse_silu_mul_quant_ep
+            from lightop.activation import fuse_silu_mul_quant_ep
+            from lightop.gemm_ops import m_grouped_w8a8_gemm_nt_masked
 
-            m_grouped_i8_gemm_nt_masked(
+            m_grouped_w8a8_gemm_nt_masked(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
@@ -520,7 +520,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 workspace1,
                 expert_num_tokens,
             )
-            m_grouped_i8_gemm_nt_masked(
+            m_grouped_w8a8_gemm_nt_masked(
                 (a2q, a2q_scale),
                 (w2, self.w2_scale),
                 output,
@@ -531,7 +531,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             # HCU's low-latency masked kernel and fused activation are supplied
             # by the proprietary DeepGEMM/LightOP wheels and imported lazily.
             from deepgemm.m_group_gemm import m_grouped_fp8_gemm_nt_masked_ll
-            from lightop import fuse_silu_mul_fp8_quant_ep
+            from lightop.activation import fuse_silu_mul_fp8_quant_ep
 
             m_grouped_fp8_gemm_nt_masked_ll(
                 (a1q, a1q_scale),

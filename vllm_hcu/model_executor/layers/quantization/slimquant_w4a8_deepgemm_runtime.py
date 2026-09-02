@@ -60,15 +60,10 @@ def m_grouped_w4a8_gemm_nt_contiguous_hipc(*args, **kwargs):
     )
 
 
-@functools.lru_cache(maxsize=None)
-def _lightop_op(name: str):
-    import lightop
-
-    return getattr(lightop, name)
-
-
 def fuse_silu_mul_quant(*args, **kwargs):
-    return _lightop_op("fuse_silu_mul_quant")(*args, **kwargs)
+    from lightop.activation import fuse_silu_mul_quant as lightop_fuse_silu_mul_quant
+
+    return lightop_fuse_silu_mul_quant(*args, **kwargs)
 
 
 def _canonical_weight_signature(layer: torch.nn.Module) -> tuple[object, ...]:
