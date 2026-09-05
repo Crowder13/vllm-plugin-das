@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import os
 import warnings
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -17,6 +19,37 @@ import torch
 # import would race the coordinator that owns the canonical replacement target.
 os.environ["VLLM_PLUGINS"] = "__disabled__"
 from vllm.utils import torch_utils
+
+
+def _glm4_output_scale_policy(
+    *, dtype: torch.dtype, aiter_requested: bool
+) -> bool:
+    source = Path("vllm_hcu/models/glm4_moe.py").read_text(
+        encoding="utf-8-sig"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_glm4_apply_routed_scale_to_output"
+    )
+    module = ast.fix_missing_locations(
+        ast.Module(body=[function], type_ignores=[])
+    )
+    namespace = {
+        "VllmConfig": object,
+        "torch": torch,
+        "is_aiter_moe_requested": lambda _config: aiter_requested,
+    }
+    exec(compile(module, "vllm_hcu/models/glm4_moe.py", "exec"), namespace)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=dtype),
+        kernel_config=SimpleNamespace(
+            moe_backend="aiter" if aiter_requested else "triton"
+        ),
+    )
+    return namespace["_glm4_apply_routed_scale_to_output"](config)
 
 
 @pytest.fixture(scope="module")
@@ -49,6 +82,57 @@ def moe_runner_module(moe_op_registrations: dict[str, dict]) -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    ("dtype", "aiter_requested", "expected"),
+    [
+        (torch.float16, False, False),
+        (torch.bfloat16, False, True),
+        (torch.float32, False, True),
+        (torch.float16, True, False),
+        (torch.bfloat16, True, False),
+    ],
+)
+def test_glm4_output_scale_policy_preserves_fp16_router_scaling(
+    dtype: torch.dtype,
+    aiter_requested: bool,
+    expected: bool,
+) -> None:
+    assert (
+        _glm4_output_scale_policy(
+            dtype=dtype,
+            aiter_requested=aiter_requested,
+        )
+        is expected
+    )
+
+
+def test_glm4_fp16_non_aiter_shared_output_keeps_routed_scale(
+    moe_runner_module: ModuleType,
+) -> None:
+    scale = 2.5
+    routed = torch.tensor([[2.0, 4.0]], dtype=torch.float16)
+    shared = torch.tensor([[3.0, 5.0]], dtype=torch.float16)
+    apply_scale_to_output = _glm4_output_scale_policy(
+        dtype=torch.float16,
+        aiter_requested=False,
+    )
+
+    # FusedMoE assigns the factor either to the router or to MoERunner.
+    routed_after_router = routed * (1.0 if apply_scale_to_output else scale)
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner.routed_scaling_factor = scale if apply_scale_to_output else 1.0
+    shared_after_runner, routed_after_runner = (
+        runner._maybe_apply_routed_scale_to_output(
+            shared.clone(), routed_after_router.clone()
+        )
+    )
+
+    assert shared_after_runner is not None
+    actual = shared_after_runner + routed_after_runner
+    expected = shared + scale * routed
+    torch.testing.assert_close(actual, expected)
+
+
 def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(
     monkeypatch: pytest.MonkeyPatch,
     moe_runner_module: ModuleType,
@@ -56,10 +140,23 @@ def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(
 ) -> None:
     """AOT must preserve the input mutation without returning an input alias."""
 
+    class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return True
+
     class Layer:
-        def _forward_impl(self, hidden_states, *_args, **_kwargs):
+        _shared_experts = SharedExperts()
+
+        def _forward_impl(
+            self,
+            hidden_states,
+            _router_logits,
+            shared_experts_input,
+            *_args,
+            **_kwargs,
+        ):
             hidden_states.add_(1)
-            return torch.full_like(hidden_states, 7), hidden_states
+            return shared_experts_input.clone(), hidden_states
 
     monkeypatch.setattr(
         moe_runner_module,
@@ -119,8 +216,65 @@ def test_inplace_moe_forward_shared_satisfies_aot_mutation_contract(
         shared_output = compiled(hidden_states)
 
     torch.testing.assert_close(hidden_states, torch.ones_like(hidden_states))
-    torch.testing.assert_close(shared_output, torch.full_like(hidden_states, 7))
+    torch.testing.assert_close(shared_output, torch.zeros_like(hidden_states))
     assert not torch._C._is_alias_of(shared_output, hidden_states)
+
+
+@pytest.mark.parametrize("shared_experts_overlap", [False, True])
+def test_inplace_moe_forward_shared_clones_only_for_runtime_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+    moe_op_registrations: dict[str, dict],
+    shared_experts_overlap: bool,
+) -> None:
+    """The opaque runtime op isolates input only before concurrent mutation."""
+
+    class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return shared_experts_overlap
+
+    class Layer:
+        _shared_experts = SharedExperts()
+
+        def _forward_impl(
+            self,
+            hidden_states,
+            _router_logits,
+            shared_experts_input,
+            *_args,
+            **_kwargs,
+        ):
+            hidden_states.add_(1)
+            return shared_experts_input.clone(), hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_layer_from_name",
+        lambda _name: Layer(),
+    )
+    hidden_states = torch.zeros((2, 2))
+    op_func = moe_op_registrations["moe_forward_shared_inplace"]["op_func"]
+
+    shared_output = op_func(
+        hidden_states,
+        None,
+        hidden_states,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "test-layer",
+        0,
+    )
+
+    torch.testing.assert_close(hidden_states, torch.ones_like(hidden_states))
+    expected_shared_output = (
+        torch.zeros_like(hidden_states)
+        if shared_experts_overlap
+        else torch.ones_like(hidden_states)
+    )
+    torch.testing.assert_close(shared_output, expected_shared_output)
 
 
 def test_fallback_moe_forward_shared_satisfies_aot_mutation_contract(
@@ -201,6 +355,42 @@ def test_fallback_moe_forward_shared_satisfies_aot_mutation_contract(
     assert not torch._C._is_alias_of(fused_output, hidden_states)
 
 
+def test_fallback_moe_forward_shared_keeps_distinct_routed_output(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+    moe_op_registrations: dict[str, dict],
+) -> None:
+    """A routed result that already owns storage must not be cloned."""
+
+    routed_output = torch.full((2, 2), 3.0)
+
+    class Layer:
+        def _forward_impl(self, hidden_states, *_args, **_kwargs):
+            return torch.full_like(hidden_states, 7), routed_output
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_layer_from_name",
+        lambda _name: Layer(),
+    )
+    hidden_states = torch.zeros((2, 2))
+    _, fused_output = moe_op_registrations["moe_forward_shared"]["op_func"](
+        hidden_states,
+        None,
+        hidden_states,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "test-layer",
+        0,
+    )
+
+    assert fused_output is routed_output
+    assert not torch._C._is_alias_of(fused_output, hidden_states)
+
+
 def make_hidden() -> torch.Tensor:
     return torch.tensor([[10.0, 11.0], [20.0, 21.0]])
 
@@ -247,18 +437,14 @@ def test_inplace_shared_output_requires_local_inplace_kernel(
 
 
 @pytest.mark.parametrize(
-    ("use_deepep", "use_aiter", "expected"),
+    ("use_deepep", "expected"),
     [
-        (False, False, True),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
+        (False, True),
+        (True, False),
     ],
 )
 def test_slimquant_marlin_only_advertises_local_inplace_output(
-    monkeypatch: pytest.MonkeyPatch,
     use_deepep: bool,
-    use_aiter: bool,
     expected: bool,
 ) -> None:
     module = importlib.import_module(
@@ -268,13 +454,218 @@ def test_slimquant_marlin_only_advertises_local_inplace_output(
     method = object.__new__(module.CompressedTensorsW8A8FP8MarlinMoEMethod)
     method.moe = object()
     method.use_deepep = use_deepep
-    monkeypatch.setattr(
-        module,
-        "_is_hcu_aiter_w8a8_moe_requested",
-        lambda moe: use_aiter,
-    )
 
     assert method.supports_inplace_output is expected
+
+
+def test_shared_input_forwarding_does_not_recompute_inplace_decision(
+    moe_runner_module: ModuleType,
+) -> None:
+    """Graph-external forwarding must not evaluate graph-unsafe backend state."""
+
+    class GraphUnsafeQuantMethod:
+        @property
+        def supports_inplace_output(self) -> bool:
+            raise AssertionError("forward re-evaluated the quant backend")
+
+    class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return True
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    runner._shared_experts = SharedExperts()
+    runner._forward_uses_mutated_hidden_states = True
+    runner.routed_input_transform = None
+    runner.routed_experts = SimpleNamespace(
+        quant_method=GraphUnsafeQuantMethod()
+    )
+    hidden_states = make_hidden()
+
+    routed_input, shared_input = runner.apply_routed_input_transform(hidden_states)
+
+    assert routed_input is hidden_states
+    assert shared_input is not None
+    assert torch._C._is_alias_of(shared_input, hidden_states)
+    torch.testing.assert_close(shared_input, hidden_states)
+
+
+def test_compiled_forward_keeps_inplace_entry_without_extra_routed_clone(
+    monkeypatch: pytest.MonkeyPatch,
+    moe_runner_module: ModuleType,
+    moe_op_registrations: dict[str, dict],
+) -> None:
+    """No-overlap compiled Marlin must retain the mutation-only entry."""
+
+    class SharedExperts:
+        def requires_input_preservation(self, _hidden_states) -> bool:
+            return False
+
+        def allows_inplace_routed_output(self, *_args) -> bool:
+            raise AssertionError("overlap policy escaped the opaque op")
+
+    class Layer:
+        _shared_experts = SharedExperts()
+
+        def _forward_impl(self, hidden_states, *_args, **_kwargs):
+            hidden_states.add_(1)
+            return torch.full_like(hidden_states, 7), hidden_states
+
+    monkeypatch.setattr(
+        moe_runner_module,
+        "get_layer_from_name",
+        lambda _name: Layer(),
+    )
+    test_library = torch.library.Library(
+        "vllm_hcu_test_moe_compiled_inplace", "FRAGMENT"
+    )
+    for op_name in ("moe_forward_shared", "moe_forward_shared_inplace"):
+        registration = moe_op_registrations[op_name]
+        torch_utils.direct_register_custom_op(
+            op_name=op_name,
+            op_func=registration["op_func"],
+            mutates_args=registration["mutates_args"],
+            fake_impl=registration["fake_impl"],
+            target_lib=test_library,
+            dispatch_key="CPU",
+            tags=registration["tags"],
+        )
+    inplace_entry = (
+        torch.ops.vllm_hcu_test_moe_compiled_inplace.moe_forward_shared_inplace
+    )
+    tuple_entry = torch.ops.vllm_hcu_test_moe_compiled_inplace.moe_forward_shared
+
+    runner = object.__new__(moe_runner_module.MoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.moe_config = SimpleNamespace(hidden_dim_unpadded=2)
+    runner.routed_experts = SimpleNamespace(
+        quant_method=SimpleNamespace(has_unpadded_output=False),
+    )
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    runner.routed_scaling_factor = 1.0
+    runner._shared_experts = SharedExperts()
+    runner.router = object()
+    runner._forward_uses_mutated_hidden_states = True
+    runner.__dict__["_forward_entry"] = inplace_entry
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_select_forward",
+        lambda self, uses_mutated=None: (
+            inplace_entry if uses_mutated else tuple_entry
+        ),
+    )
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_maybe_pad_hidden_states",
+        lambda self, shared, hidden: (hidden, None, None),
+    )
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_encode_layer_name",
+        lambda self: "test-layer",
+    )
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_maybe_reduce_shared_expert_output",
+        lambda self, shared: shared,
+    )
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_maybe_reduce_final_output",
+        lambda self, output, _truncate: output,
+    )
+    monkeypatch.setattr(
+        moe_runner_module.MoERunner,
+        "_maybe_add_zero_expert_output",
+        lambda self, output: output,
+    )
+
+    compiled = torch.compile(runner.forward, backend="aot_eager", fullgraph=True)
+    compiled(make_hidden(), None)
+    hidden_states = make_hidden()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        output = compiled(hidden_states, None)
+
+    clone_count = sum(
+        event.count for event in profile.key_averages() if event.key == "aten::clone"
+    )
+    assert clone_count == 1
+    torch.testing.assert_close(output, make_hidden() + 8)
+
+
+@pytest.mark.parametrize(
+    ("order", "expected"),
+    [
+        ("NO_OVERLAP", False),
+        ("MK_INTERNAL_OVERLAPPED", True),
+        ("MULTI_STREAM_OVERLAPPED", True),
+    ],
+)
+def test_shared_experts_preserve_input_only_while_routed_work_can_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    expected: bool,
+) -> None:
+    """Every overlapping execution order must retain the pristine input."""
+
+    shared_experts_module = importlib.import_module(
+        "vllm_hcu.model_executor.layers.fused_moe.shared_experts"
+    )
+    shared_experts = object.__new__(shared_experts_module.SharedExperts)
+    monkeypatch.setattr(
+        shared_experts,
+        "_determine_shared_experts_order",
+        lambda _hidden_states: getattr(
+            shared_experts_module.SharedExpertsOrder, order
+        ),
+    )
+
+    assert shared_experts.requires_input_preservation(make_hidden()) is expected
+
+
+@pytest.mark.parametrize(
+    ("order", "alias_kind", "expected"),
+    [
+        ("NO_OVERLAP", "same", True),
+        ("NO_OVERLAP", "view", True),
+        ("MK_INTERNAL_OVERLAPPED", "same", False),
+        ("MK_INTERNAL_OVERLAPPED", "view", False),
+        ("MULTI_STREAM_OVERLAPPED", "same", False),
+        ("MULTI_STREAM_OVERLAPPED", "distinct", True),
+    ],
+)
+def test_shared_experts_allow_inplace_routing_only_without_an_input_race(
+    monkeypatch: pytest.MonkeyPatch,
+    order: str,
+    alias_kind: str,
+    expected: bool,
+) -> None:
+    """Views race during overlap; transformed or padded inputs do not."""
+
+    shared_experts_module = importlib.import_module(
+        "vllm_hcu.model_executor.layers.fused_moe.shared_experts"
+    )
+    shared_experts = object.__new__(shared_experts_module.SharedExperts)
+    monkeypatch.setattr(
+        shared_experts,
+        "_determine_shared_experts_order",
+        lambda _hidden_states: getattr(
+            shared_experts_module.SharedExpertsOrder, order
+        ),
+    )
+    shared_input = make_hidden()
+    routed_input = {
+        "same": shared_input,
+        "view": shared_input.view_as(shared_input),
+        "distinct": shared_input.clone(),
+    }[alias_kind]
+
+    assert (
+        shared_experts.allows_inplace_routed_output(routed_input, shared_input)
+        is expected
+    )
 
 
 def test_forward_entry_refreshes_after_runtime_reconfiguration(
@@ -452,7 +843,9 @@ def test_shared_and_routed_outputs_keep_local_token_order_before_addition(
     runner.routed_input_transform = None
     runner.routed_output_transform = None
     runner.routed_scaling_factor = 1.0
-    runner._shared_experts = object()
+    runner._shared_experts = SimpleNamespace(
+        allows_inplace_routed_output=lambda _routed, _shared: True
+    )
     runner.router = object()
     shared_output = torch.tensor([[100.0, 101.0], [200.0, 201.0]])
     fused_output = torch.tensor([[10.0, 11.0], [20.0, 21.0]])
