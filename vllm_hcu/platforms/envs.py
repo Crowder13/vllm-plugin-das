@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CAT_MLA: bool = False
     VLLM_HCU_DISABLE_DSA: bool = False
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
-    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
+    VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM: bool = True
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_AITER_W8A8_FP8_MOE: bool = False
     VLLM_HCU_USE_LIGHTOP_MOE_ALIGN: bool = False
     VLLM_HCU_USE_LIGHTOP_EP_SCATTER: bool = True
-    VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = False
+    VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8: bool = True
     VLLM_HCU_FUSED_MOE_CHUNK_SIZE: Optional[int] = None
     VLLM_HCU_USE_GLOBAL_MOE_CACHE: bool = False
     VLLM_HCU_USE_FUSED_RMS_QUANT: bool = False
@@ -196,7 +196,8 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
                  ("true", "1")),  
-    # If set, control hcu custom gemm including w8a8 int8/fp8 etc
+    # Enable HCU custom quantization GEMMs by default. Channel-wise FP8 uses
+    # LightOp when enabled and retains the vLLM Triton path when disabled.
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in
              ("true", "1")),
@@ -311,9 +312,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_EP_SCATTER", "True").lower() in
                  ("true", "1")),
 
-    # If set, use LightOp per-token fp8 quant for dynamic PER_TOKEN QuantFP8.
+    # Use LightOp per-token fp8 quant for dynamic PER_TOKEN QuantFP8 by
+    # default. Set to 0/False to use the native fallback.
     "VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8":
-        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "False").lower() in
+        lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_PER_TOKEN_QUANT_FP8", "True").lower() in
                  ("true", "1")),
 
     # Optional override for LightOp's fused-MoE chunk size.

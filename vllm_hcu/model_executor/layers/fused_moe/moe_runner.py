@@ -189,7 +189,9 @@ def _moe_forward_shared(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
     )
-    return shared_output, fused_output.clone()
+    if torch._C._is_alias_of(fused_output, hidden_states):
+        fused_output = fused_output.clone()
+    return shared_output, fused_output
 
 
 def _moe_forward_shared_fake(
@@ -233,6 +235,15 @@ def _moe_forward_shared_inplace(
     hidden_dim_unpadded: int,
 ) -> torch.Tensor:
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    if (
+        shared_experts_input is not None
+        and layer._shared_experts is not None
+        and torch._C._is_alias_of(shared_experts_input, hidden_states)
+        and layer._shared_experts.requires_input_preservation(
+            shared_experts_input
+        )
+    ):
+        shared_experts_input = shared_experts_input.clone()
     shared_output, fused_output = layer._forward_impl(
         hidden_states,
         router_logits,
@@ -391,8 +402,13 @@ class MoERunner(MoERunnerInterface):
         )
         self._forward_entry = self._select_forward()
 
-    def _select_forward(self) -> Callable:
-        if self._forward_uses_mutated_hidden_states:
+    def _select_forward(
+        self,
+        uses_mutated_hidden_states: bool | None = None,
+    ) -> Callable:
+        if uses_mutated_hidden_states is None:
+            uses_mutated_hidden_states = self._forward_uses_mutated_hidden_states
+        if uses_mutated_hidden_states:
             if current_platform.is_tpu() or current_platform.is_cpu():
                 return _moe_forward_shared_inplace
             return torch.ops.vllm.moe_forward_shared_inplace
@@ -884,7 +900,15 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
-        result = self._forward_entry(
+        # Keep runtime alias handling inside the opaque mutation-only op.  In
+        # particular, do not switch compiled calls to the tuple-returning op:
+        # an in-place routed kernel would then need another full output clone.
+        forward_uses_mutated_hidden_states = (
+            self._forward_uses_mutated_hidden_states
+        )
+        forward_entry = self._forward_entry
+
+        result = forward_entry(
             hidden_states,
             router_logits,
             shared_experts_input,
@@ -910,7 +934,7 @@ class MoERunner(MoERunnerInterface):
 
         # Extract outputs from result. The mutation-only custom op returns
         # shared output and exposes routed output through hidden_states.
-        if self._forward_uses_mutated_hidden_states:
+        if forward_uses_mutated_hidden_states:
             shared_output, fused_output = result, hidden_states
         else:
             shared_output, fused_output = _unpack(result)

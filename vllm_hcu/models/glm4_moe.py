@@ -35,7 +35,9 @@ from torch import nn
 from transformers.models.glm4_moe import Glm4MoeConfig
 
 import vllm_hcu.platforms.envs as henvs
-from vllm_hcu.patch.config import get_hcu_config
+from vllm_hcu.model_executor.layers.fused_moe.aiter_runtime import (
+    is_aiter_moe_requested,
+)
 from vllm_hcu.model_executor.layers.sp_utils import (
     configure_hcu_runtime_sp,
     finalize_attention_output_for_sp,
@@ -51,6 +53,7 @@ from vllm_hcu.model_executor.layers.sp_utils import (
     sp_mlp_down_proj_reduce_results,
     use_sp_mlp_token_gather,
 )
+from vllm_hcu.patch.config import get_hcu_config
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -102,6 +105,20 @@ logger = init_logger(__name__)
 
 def fused_qkv_cache_layout_supported(attn_backend: type) -> bool:
     return attn_backend.get_name() != "TRITON_ATTN"
+
+
+def _glm4_apply_routed_scale_to_output(vllm_config: VllmConfig) -> bool:
+    """Choose GLM routed scaling without breaking FP16 residual semantics."""
+
+    # MoERunner's FP16 overflow path scales the shared output down instead of
+    # scaling the routed output up. Models using that path must also scale the
+    # residual stream, as DeepSeek does. GLM does not have that compensation,
+    # so keep its FP16 factor in the router weights. AITER consumes the routed
+    # factor internally for every dtype.
+    return (
+        vllm_config.model_config.dtype != torch.float16
+        and not is_aiter_moe_requested(vllm_config.kernel_config)
+    )
 
 
 class Glm4MoeMLP(nn.Module):
@@ -260,7 +277,13 @@ class Glm4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             routed_scaling_factor=self.routed_scaling_factor,
-            #apply_routed_scale_to_output=True,
+            # AITER consumes scaled router weights. BF16/FP32 non-AITER
+            # backends apply the factor after expert aggregation. FP16 keeps
+            # router scaling because GLM has no residual-stream compensation
+            # for MoERunner's overflow-protection convention.
+            apply_routed_scale_to_output=_glm4_apply_routed_scale_to_output(
+                vllm_config
+            ),
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,

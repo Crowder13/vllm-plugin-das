@@ -174,7 +174,24 @@ def test_all2all_dispatch_selection_contract():
     assert result.use_int8_dispatch is True
 
 
-def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
+@pytest.mark.parametrize(
+    ("fixed_use_low_latency", "expected_cleanup"),
+    [(None, True), (True, False), (False, False)],
+)
+def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_use_low_latency: bool | None,
+    expected_cleanup: bool,
+):
+    from vllm_hcu.model_executor.layers.fused_moe.prepare_finalize import (
+        deepep_auto,
+    )
+
+    monkeypatch.setattr(
+        deepep_auto,
+        "dspark_mooncake_pd_use_low_latency",
+        lambda _vllm_config: fixed_use_low_latency,
+    )
     calls: dict[str, object] = {}
 
     class Manager:
@@ -282,6 +299,11 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
+    assert result._fixed_use_low_latency is fixed_use_low_latency
+    assert (
+        result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer
+        is expected_cleanup
+    )
     int8_result = module.maybe_make_prepare_finalize(
         moe,
         SimpleNamespace(quant_dtype=torch.int8),
@@ -296,6 +318,11 @@ def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
         "physical_to_global": "physical-to-global",
         "local_expert_global_ids": "local-ids",
     }
+    assert int8_result._fixed_use_low_latency is fixed_use_low_latency
+    assert (
+        int8_result.ll_prepare_finalize._vllm_hcu_clean_low_latency_buffer
+        is expected_cleanup
+    )
     assert module.maybe_roundup_layer_hidden_size(
         10, torch.float16, moe.moe_parallel_config
     ) == 13
@@ -4296,8 +4323,17 @@ def test_deepep_ll_non_hcu_dispatch_signatures_delegate_to_upstream(
     )
 
 
-def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
+@pytest.mark.parametrize(
+    ("shared_with_high_throughput", "expected_clean_calls"),
+    [
+        (False, []),
+        (True, [(8, 2048, 1, 128), (8, 2048, 1, 128)]),
+    ],
+)
+def test_deepep_ll_fp8_cleans_only_when_buffer_is_shared_with_high_throughput(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_high_throughput: bool,
+    expected_clean_calls: list[tuple[int, int, int, int]],
 ):
     module = _fake_deepep_ll_module()
     module.torch = torch
@@ -4367,6 +4403,10 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
             return expert_x, torch.ones(1, dtype=torch.int32), "handle", None, lambda: None
 
     instance = cls(Buffer(), 8, 1, use_fp8_dispatch=True)
+    if shared_with_high_throughput:
+        instance._vllm_hcu_clean_low_latency_buffer = True
+    else:
+        del instance._vllm_hcu_clean_low_latency_buffer
     instance.handles = [None]
     instance.use_int8_dispatch = False
     instance.use_ue8m0_dispatch = False
@@ -4411,14 +4451,13 @@ def test_deepep_ll_fp8_auto_detects_hcu_buffer_dispatch_abi(
     assert calls["topk_weight"] is topk_weights
     assert calls["quant_type"] == 2
     assert calls["quant_group_size"] == 128
-    assert calls["clean"] == [
-        (8, 2048, 1, 128),
-        (8, 2048, 1, 128),
-    ]
+    assert calls.get("clean", []) == expected_clean_calls
 
 
+@pytest.mark.parametrize("shared_with_high_throughput", [False, True])
 def test_deepep_ll_hcu_int8_dispatch_contract(
     monkeypatch: pytest.MonkeyPatch,
+    shared_with_high_throughput: bool,
 ):
     module = _fake_deepep_ll_module()
 
@@ -4462,6 +4501,7 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
             return expert_x, expert_counts, "handle", None, lambda: None
 
     instance = cls(Buffer(), 8, 1, use_int8_dispatch=True)
+    instance._vllm_hcu_clean_low_latency_buffer = shared_with_high_throughput
     instance.handles = [None, None]
     instance.use_ue8m0_dispatch = False
     quant_config = SimpleNamespace(
@@ -4510,12 +4550,16 @@ def test_deepep_ll_hcu_int8_dispatch_contract(
         False,
         quant_config,
     )
-    assert calls["order"] == [
-        ("clean", (8, 2048, 1, 0)),
-        ("dispatch", 1),
-        ("clean", (8, 2048, 1, 0)),
-        ("dispatch", 1),
-    ]
+    expected_dispatches = [("dispatch", 1), ("dispatch", 1)]
+    if shared_with_high_throughput:
+        assert calls["order"] == [
+            ("clean", (8, 2048, 1, 0)),
+            expected_dispatches[0],
+            ("clean", (8, 2048, 1, 0)),
+            expected_dispatches[1],
+        ]
+    else:
+        assert calls["order"] == expected_dispatches
 
     fp8_instance = cls(None, 8, 1, use_fp8_dispatch=True)
     fp8_instance.use_int8_dispatch = False
@@ -4539,6 +4583,145 @@ def test_custom_op_runner_rejects_post_import_callback():
     official = ModuleType(patch_moe_runner.TARGET_MODULE)
     with pytest.raises(PatchCompatibilityError, match="must be replaced before import"):
         patch_moe_runner.apply_to_module(official)
+
+
+def test_moe_runner_adapter_rejects_incompatible_input_transform_signature():
+    module = ModuleType(patch_moe_runner.REPLACEMENT_MODULE)
+
+    def moe_forward(
+        hidden_states,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        quanted_hidden_states,
+        scale,
+        topk_weights,
+        topk_ids,
+        layer_name,
+        hidden_dim_unpadded,
+    ):
+        return None
+
+    for name in (
+        "_moe_forward",
+        "_moe_forward_fake",
+        "_moe_forward_shared",
+        "_moe_forward_shared_fake",
+        "_moe_forward_shared_inplace",
+        "_moe_forward_shared_inplace_fake",
+    ):
+        setattr(module, name, moe_forward)
+
+    class MoERunner:
+        def apply_routed_input_transform(self, *, hidden_states):
+            return None
+
+        def forward(
+            self,
+            hidden_states,
+            router_logits,
+            input_ids,
+            quanted_hidden_states,
+            scale,
+            topk_weights,
+            topk_ids,
+        ):
+            return None
+
+    module.MoERunner = MoERunner
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="apply_routed_input_transform",
+    ):
+        patch_moe_runner.apply_to_module(module)
+
+
+def test_shared_experts_adapter_rejects_incompatible_preservation_signature():
+    module = ModuleType(patch_shared_experts.REPLACEMENT_MODULE)
+
+    class SharedExperts:
+        def requires_input_preservation(self, *, hidden_states):
+            return False
+
+        def maybe_sync_shared_experts_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def _run_in_aux_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def forward(
+            self,
+            shared_experts_input,
+            order,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        @property
+        def output(self):
+            return None
+
+    module.SharedExperts = SharedExperts
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="requires_input_preservation",
+    ):
+        patch_shared_experts.apply_to_module(module)
+
+
+def test_shared_experts_adapter_rejects_incompatible_inplace_output_signature():
+    module = ModuleType(patch_shared_experts.REPLACEMENT_MODULE)
+
+    class SharedExperts:
+        def requires_input_preservation(self, hidden_states):
+            return False
+
+        def allows_inplace_routed_output(self, routed_input):
+            return False
+
+        def maybe_sync_shared_experts_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def _run_in_aux_stream(
+            self,
+            shared_experts_input,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        def forward(
+            self,
+            shared_experts_input,
+            order,
+            x_and_scale_quanted,
+        ):
+            return None
+
+        @property
+        def output(self):
+            return None
+
+    module.SharedExperts = SharedExperts
+
+    with pytest.raises(
+        PatchCompatibilityError,
+        match="allows_inplace_routed_output",
+    ):
+        patch_shared_experts.apply_to_module(module)
 
 
 def test_moe_runner_and_shared_experts_cold_replacement_contract():
@@ -4615,6 +4798,11 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
             "self", "hidden_states", "router_logits", "input_ids",
             "quanted_hidden_states", "scale", "topk_weights", "topk_ids",
         )
+        assert tuple(
+            inspect.signature(
+                shared_module.SharedExperts.allows_inplace_routed_output
+            ).parameters
+        ) == ("self", "routed_input", "shared_input")
 
         class QuantMethod:
             is_monolithic = False
