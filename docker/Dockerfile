@@ -91,3 +91,7 @@ RUN wget -q ${RESOURCE_SERVER_URL}/pkg/openmpi/ucx-1.21.0.tar.gz \
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
+
+# 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
+ARG IMAGE_TAG
+ENV IMAGE_TAG=${IMAGE_TAG}
