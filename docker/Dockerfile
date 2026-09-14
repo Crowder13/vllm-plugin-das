@@ -11,26 +11,6 @@ SHELL ["/bin/bash", "-c"]
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
-# CI 环境锁定 Python 3.10; 部分基础镜像的 python3 仍指向系统 Python 3.6.
-# GitHub runner 还可能把 /home/github/.local/bin 放到 PATH 前面, 这里同步修正。
-RUN PYTHON_BIN="$(readlink -f "$(command -v python3.10)")" && \
-    "$PYTHON_BIN" -c 'import sys; assert sys.version_info[:2] == (3, 10), sys.version' && \
-    mkdir -p /home/github/.local/bin && \
-    ln -sf "$PYTHON_BIN" /usr/local/bin/python && \
-    ln -sf "$PYTHON_BIN" /usr/local/bin/python3 && \
-    ln -sf "$PYTHON_BIN" /usr/local/bin/python3.10 && \
-    ln -sf "$PYTHON_BIN" /home/github/.local/bin/python && \
-    ln -sf "$PYTHON_BIN" /home/github/.local/bin/python3 && \
-    if [[ "$PYTHON_BIN" != "/home/github/.local/bin/python3.10" ]]; then \
-        ln -sf "$PYTHON_BIN" /home/github/.local/bin/python3.10; \
-    fi && \
-    "$PYTHON_BIN" -m pip --version && \
-    printf '%s\n' '#!/bin/bash' "exec ${PYTHON_BIN} -m pip \"\$@\"" > /usr/local/bin/pip && \
-    printf '%s\n' '#!/bin/bash' "exec ${PYTHON_BIN} -m pip \"\$@\"" > /usr/local/bin/pip3 && \
-    chmod +x /usr/local/bin/pip /usr/local/bin/pip3 && \
-    ln -sf /usr/local/bin/pip /home/github/.local/bin/pip && \
-    ln -sf /usr/local/bin/pip3 /home/github/.local/bin/pip3
-
 # pip 配置 + das-install
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
@@ -108,3 +88,7 @@ RUN wget -q ${RESOURCE_SERVER_URL}/pkg/openmpi/ucx-1.21.0.tar.gz \
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
+
+# 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
+ARG IMAGE_TAG
+ENV IMAGE_TAG=${IMAGE_TAG}
