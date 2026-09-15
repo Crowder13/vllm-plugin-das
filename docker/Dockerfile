@@ -45,6 +45,12 @@ RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp
     bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
     rm -f /tmp/hcu_llvm_installer.sh
 
+# 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
+RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
+    chmod +x /tmp/dtk_blas_cut_installer.sh && \
+    bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
+    rm -f /tmp/dtk_blas_cut_installer.sh
+
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
 RUN pip install --no-cache-dir ninja wheel setuptools \
@@ -76,6 +82,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && das-install nixl ${TORCH_TAG} \
     # tilelang 放最后: 安装真实包会替换上面 vLLM 层写的 0.1.10 stub, 之后不应再有触发 vllm 依赖解析的安装
     && das-install tilelang ${TORCH_TAG} \
+    && pip install --no-cache-dir apache-tvm-ffi==0.1.11 \
     && pip install --no-cache-dir numpy==1.25.0 \
     && pip cache purge
     
