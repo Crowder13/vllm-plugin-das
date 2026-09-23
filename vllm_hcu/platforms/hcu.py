@@ -29,8 +29,13 @@ logger = init_logger(__name__)
 _ensure_platform_plugin_ready()
 
 
-def get_hcu_flash_attn_mode() -> str:
-    """Resolve the HCU flash-attention sub-mode from serialized config."""
+def get_hcu_flash_attn_mode(vllm_config: "VllmConfig | None" = None) -> str:
+    """Resolve the HCU flash-attention sub-mode from serialized config.
+
+    A forward pass already has the worker's deserialised ``VllmConfig``.  Let
+    callers provide it directly because Model Runner V2 does not necessarily
+    install that object as vLLM's process-global current config.
+    """
 
     try:
         from vllm.config import get_current_vllm_config_or_none
@@ -41,7 +46,9 @@ def get_hcu_flash_attn_mode() -> str:
 
     from vllm_hcu.patch.config import get_hcu_config
 
-    config = get_current_vllm_config_or_none()
+    config = vllm_config
+    if config is None:
+        config = get_current_vllm_config_or_none()
     explicit_mode = (
         None if config is None else get_hcu_config(config).hcu_flash_attn_mode
     )
@@ -164,6 +171,8 @@ def _get_backend_priorities(
 
 def register_attention_backends() -> None:
     # Install HCU defaults without replacing user or third-party overrides.
+    # QSA is model-local and dispatches triton/cutlass/boltops in its own
+    # adapter; it intentionally does not become a global enum backend here.
     backends = (
         (
             AttentionBackendEnum.TRITON_ATTN,
