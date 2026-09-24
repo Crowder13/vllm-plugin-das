@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FP8_MIXED_BATCH: bool = False
     VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM : bool = False
     VLLM_HCU_USE_CUSTOM_OPS : bool = False
+    VLLM_HCU_QSA_BACKEND: str = "cutlass"
     VLLM_HCU_USE_CUSTOM_SILU_AND_MUL : bool = False
     VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM : bool = False
     VLLM_HCU_USE_SKIP_WEIGHT_DEBUG : bool = False
@@ -68,6 +69,8 @@ if TYPE_CHECKING:
     VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE: bool = False
     VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH: bool = False
     VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS: bool = False
+    VLLM_HCU_PLE_CPU_OFFLOAD: bool = False
+    VLLM_HCU_PLE_PREFETCH_STREAM: bool = False
 
 def maybe_convert_int(value: Optional[str]) -> Optional[int]:
     """
@@ -86,6 +89,18 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 
 def _environment_flag(raw: str) -> bool:
     return raw.lower() in ("true", "1")
+
+
+def custom_ops_enabled() -> bool:
+    """Return whether the HCU custom-op master switch is enabled."""
+    return _environment_flag(os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True"))
+
+
+def ple_prefetch_enabled() -> bool:
+    """Resolve PLE stream prefetch under the custom-op master switch."""
+    return custom_ops_enabled() and _environment_flag(
+        os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False")
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -195,8 +210,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
-    lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True").lower() in
-             ("true", "1")),
+    custom_ops_enabled,
+    # Select the QSA implementation independently of the generic
+    # FLASH_ATTN backend mode. The QSA dispatcher validates the enum and
+    # applies VLLM_HCU_USE_CUSTOM_OPS as its master gate.
+    "VLLM_HCU_QSA_BACKEND":
+    lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
     # If set, control hcu custom silu and mul op
     "VLLM_HCU_USE_CUSTOM_SILU_AND_MUL":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_SILU_AND_MUL", "True").lower() in
@@ -425,6 +444,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS":
         lambda: (os.environ.get("VLLM_HCU_ENABLE_REQUEST_CUDAGRAPH_BUCKETS", "False").lower() in
                     ("true", "1")),
+
+    # Compatibility fallback for Qwen4Exp PLE INT8 CPU offload when the target
+    # VllmConfig has no EngramConfig. An explicit EngramConfig.cpu_offload value
+    # takes precedence. CPU offload requires the HCU UVA operator.
+    "VLLM_HCU_PLE_CPU_OFFLOAD":
+        lambda: (os.environ.get("VLLM_HCU_PLE_CPU_OFFLOAD", "False").lower() in
+                    ("true", "1")),
+
+    # Overlap Qwen4Exp PLE INT8 UVA lookup with preceding model compute. This
+    # is intentionally opt-in, is gated by VLLM_HCU_USE_CUSTOM_OPS, and does
+    # not enable FP8 prefetch.
+    "VLLM_HCU_PLE_PREFETCH_STREAM":
+        ple_prefetch_enabled,
 }
 
 # end-env-vars-definition

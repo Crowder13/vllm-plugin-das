@@ -224,7 +224,12 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_model_state")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_mtp_pp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_conv")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_int8")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_prefetch")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_cudagraph")),
     _CallbackSpec(_adapter("core_fix", "patch_rocm_mla_sparse_metadata")),
 )
 
@@ -242,6 +247,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_mla_layer"), feature="lightly_cp"),
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_recompute_w_u")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),

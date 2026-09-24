@@ -21,7 +21,12 @@ from . import (
     patch_qwen3_vl,
     patch_qwen3_vl_moe,
     patch_qwen4_exp,
+    patch_qwen4_exp_model_state,
+    patch_qwen4_exp_mtp_pp,
+    patch_qwen4_exp_ple_cudagraph,
     patch_qwen4_exp_ple_conv,
+    patch_qwen4_exp_ple_int8,
+    patch_qwen4_exp_ple_prefetch,
     patch_rocm_mla_sparse_metadata,
 )
 
@@ -39,6 +44,11 @@ __all__ = [
     "patch_qwen3_vl",
     "patch_qwen3_vl_moe",
     "patch_qwen4_exp",
+    "patch_qwen4_exp_model_state",
+    "patch_qwen4_exp_mtp_pp",
+    "patch_qwen4_exp_ple_cudagraph",
     "patch_qwen4_exp_ple_conv",
+    "patch_qwen4_exp_ple_int8",
+    "patch_qwen4_exp_ple_prefetch",
     "patch_rocm_mla_sparse_metadata",
 ]
