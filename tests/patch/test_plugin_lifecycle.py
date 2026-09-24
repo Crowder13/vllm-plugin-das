@@ -178,11 +178,11 @@ def test_plugin_entries_are_interleavable_idempotent_and_registry_backed(monkeyp
 
     real_import_module = plugin.importlib.import_module
 
-    def import_module(name: str):
+    def import_module(name: str, package=None):
         if name == "vllm_hcu.ops":
             calls.append("ops")
             return ModuleType(name)
-        return real_import_module(name)
+        return real_import_module(name, package)
 
     monkeypatch.setattr(plugin.importlib, "import_module", import_module)
 
@@ -286,9 +286,12 @@ def test_platform_probe_failure_is_exposed_on_vllm_second_invocation(monkeypatch
     assert calls == ["apply"]
 
 
-def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules():
+@pytest.mark.parametrize("no_site", [False, True])
+def test_clean_plugin_import_has_no_legacy_hook_or_eager_runtime_modules(
+    no_site,
+):
     result = _fresh_python(
-        r'''
+        "no_site = " + repr(no_site) + "\n" + r'''
 import builtins
 import json
 import sys
@@ -304,8 +307,19 @@ heavy = [
     "vllm_hcu.v1.executor.multiproc_executor",
 ]
 old_import = builtins.__import__
+heavy_import_attempts = []
+
+class ImportProbe:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in heavy:
+            heavy_import_attempts.append(fullname)
+        return None
+
+sys.meta_path.insert(0, ImportProbe())
 import vllm_hcu
 path = vllm_hcu.hcu_platform_plugin()
+if not no_site:
+    assert vllm_hcu._PLATFORM_INIT_FAILURE is None, vllm_hcu._PLATFORM_INIT_FAILURE
 
 print(
     json.dumps(
@@ -315,12 +329,13 @@ print(
             "builtins_same": builtins.__import__ is old_import,
             "patch_utils": "vllm_hcu.patch_utils" in sys.modules,
             "heavy": [name for name in heavy if name in sys.modules],
+            "heavy_import_attempts": heavy_import_attempts,
         }
     )
 )
 ''',
         assert_target_source=False,
-        no_site=True,
+        no_site=no_site,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(
@@ -336,6 +351,7 @@ print(
         "builtins_same": True,
         "patch_utils": False,
         "heavy": [],
+        "heavy_import_attempts": [],
     }
 
 
@@ -501,7 +517,9 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     monkeypatch.setattr(
         worker_dispatcher,
         "validate_worker_patches",
-        lambda *, require_applied: events.append(("validate", require_applied)),
+        lambda *, require_applied, phase: events.append(
+            ("validate", require_applied, phase)
+        ),
     )
 
     def parent_init(self, **kwargs):
@@ -538,10 +556,90 @@ def test_worker_applies_before_parent_init_and_validates_after_load(
     ]
 
     worker.load_model(load_dummy_weights=True)
-    assert events[-2:] == [("parent_load", True), ("validate", True)]
+    assert events[-2:] == [
+        ("parent_load", True),
+        ("validate", True, "model_load"),
+    ]
     assert str(inspect.signature(worker_module.HcuGPUWorker.load_model)) == (
         "(self, *, load_dummy_weights: bool = False) -> None"
     )
+
+
+def test_worker_drains_and_terminal_validates_after_successful_warmup(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
+    from vllm_hcu.patch import import_coordinator, worker as worker_dispatcher
+
+    worker_module = cpu_safe_hcu_worker_module
+    events: list[object] = []
+
+    class FakeCoordinator:
+        def drain_ready_callbacks(self):
+            events.append("drain")
+
+    monkeypatch.setattr(
+        import_coordinator,
+        "IMPORT_COORDINATOR",
+        FakeCoordinator(),
+    )
+    monkeypatch.setattr(
+        worker_dispatcher,
+        "validate_worker_patches",
+        lambda *, require_applied, phase: events.append(
+            ("validate", require_applied, phase)
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module.Worker,
+        "compile_or_warm_up_model",
+        lambda self: events.append("parent_warmup") or "warmup-result",
+        raising=False,
+    )
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.use_v2_model_runner = False
+
+    assert worker.compile_or_warm_up_model() == "warmup-result"
+    assert events == [
+        "parent_warmup",
+        "drain",
+        ("validate", True, "runtime"),
+    ]
+
+
+def test_worker_does_not_validate_after_failed_warmup(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+):
+    from vllm_hcu.patch import import_coordinator, worker as worker_dispatcher
+
+    worker_module = cpu_safe_hcu_worker_module
+
+    class FakeCoordinator:
+        def drain_ready_callbacks(self):
+            pytest.fail("callback drain ran after failed warmup")
+
+    monkeypatch.setattr(
+        import_coordinator,
+        "IMPORT_COORDINATOR",
+        FakeCoordinator(),
+    )
+    monkeypatch.setattr(
+        worker_dispatcher,
+        "validate_worker_patches",
+        lambda **kwargs: pytest.fail("validation ran after failed warmup"),
+    )
+    monkeypatch.setattr(
+        worker_module.Worker,
+        "compile_or_warm_up_model",
+        lambda self: (_ for _ in ()).throw(RuntimeError("warmup failed")),
+        raising=False,
+    )
+    worker = object.__new__(worker_module.HcuGPUWorker)
+    worker.use_v2_model_runner = False
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        worker.compile_or_warm_up_model()
 
 
 @pytest.mark.parametrize(

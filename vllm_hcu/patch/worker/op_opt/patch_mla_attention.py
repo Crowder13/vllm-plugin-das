@@ -267,7 +267,8 @@ def apply_to_module(module: ModuleType) -> bool:
         config = getattr(self, "_hcu_feature_config", None)
         if config is None:
             raise RuntimeError("HCU MLA feature config was not initialized")
-        if not config.enable_lightly_cp:
+        q_dcp_replicated = getattr(self, "_hcu_q_dcp_replicated", None)
+        if not config.enable_lightly_cp and q_dcp_replicated is None:
             return original_forward(
                 self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
                 output_scale, output_block_scale, quant_group_size,
@@ -275,10 +276,17 @@ def apply_to_module(module: ModuleType) -> bool:
             )
         from vllm_hcu.model_executor.layers.mla_runtime import mla_forward_impl
 
+        if q_dcp_replicated is None:
+            return mla_forward_impl(
+                mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata,
+                output, output_scale, output_block_scale, quant_group_size,
+                quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            )
         return mla_forward_impl(
             mla, self, q, k_c_normed, k_pe, kv_cache, attn_metadata, output,
             output_scale, output_block_scale, quant_group_size,
             quant_scale_ue8m0, quant_col_major, quant_tma_aligned,
+            q_dcp_replicated=q_dcp_replicated,
         )
 
     @functools.wraps(process)
@@ -329,18 +337,13 @@ def apply_to_module(module: ModuleType) -> bool:
         require_uniform=False,
         treat_short_extends_as_decodes=True,
     ):
-        # Warmup/capture placeholders do not carry request phase metadata.
-        # Preserve the target vLLM decode classification in that case, while
-        # retaining HCU's prefix-hit short-extend policy for real requests.
-        del treat_short_extends_as_decodes
-        hcu_treat_short_extends_as_decodes = (
-            getattr(common_attn_metadata, "is_prefilling", None) is None
-        )
+        # This wrapper only adds HCU MLA metadata. Keep vLLM's request-phase
+        # classification intact so short prefills follow the target backend.
         return split_batch(
             common_attn_metadata,
             decode_threshold,
             require_uniform,
-            hcu_treat_short_extends_as_decodes,
+            treat_short_extends_as_decodes,
         )
 
     for function in (

@@ -57,6 +57,12 @@ register_hcu_ci(
 
 register_hcu_ci(
     job="hy4-contract",
+    target="tests/models/hy_v4/test_dcp_q_replicate.py",
+    est_time=30,
+)
+
+register_hcu_ci(
+    job="hy4-contract",
     target="tests/models/hy_v4/test_custom_w4a8.py",
     est_time=60,
 )
@@ -178,6 +184,12 @@ register_hcu_ci(
     job="accuracy-gfx938",
     target="tests/accuracy/test_unified_aiter_moe_operator.py",
     est_time=330,
+)
+
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/runtime_patch/test_flashmla_decode_align_triton_mla.py",
+    est_time=180,
 )
 
 register_hcu_ci(
