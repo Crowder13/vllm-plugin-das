@@ -22,9 +22,12 @@ from vllm_hcu.models.hy_v4.attention import (
     is_skip_topk_indexer_weight,
     require_local_indexer_producer,
     require_hyv4_sink_backend,
-    linear_gate_pcp_block_tokens,
-    linear_gate_pcp_chunking_enabled,
     linear_gate_pcp_shard_enabled,
+    _linear_gate_pcp_group_ranks,
+    _linear_gate_pcp_subgroup_cache_key,
+    _linear_gate_pcp_groups,
+    _get_linear_gate_pcp_group,
+    clear_linear_gate_pcp_groups,
 )
 
 
@@ -91,26 +94,147 @@ def test_hy_v4_preserves_native_kv_cache_dtype(cache_dtype: str) -> None:
     )
 
 
-def test_linear_gate_pcp_chunking_can_be_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_CHUNKING", "0")
-    assert linear_gate_pcp_chunking_enabled() is False
-
-
-def test_linear_gate_pcp_block_tokens_is_configurable(monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", "1024")
-    assert linear_gate_pcp_block_tokens() == 1024
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
-def test_linear_gate_pcp_rejects_invalid_block_tokens(monkeypatch, value) -> None:
-    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_BLOCK_TOKENS", value)
-    with pytest.raises(ValueError, match="positive integer"):
-        linear_gate_pcp_block_tokens()
-
-
 def test_linear_gate_pcp_sharding_flag_remains_independent(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "1")
     assert linear_gate_pcp_shard_enabled() is True
+
+
+def test_linear_gate_pcp_subgroup_cache_key_preserves_group_boundaries() -> None:
+    """group=2 and group=4 cover the same ranks but must not share a cache key."""
+    ranks_g2 = _linear_gate_pcp_group_ranks(
+        world=8, dp_size=1, pp_size=1, pcp_size=8, tp_size=1, group_size=2
+    )
+    ranks_g4 = _linear_gate_pcp_group_ranks(
+        world=8, dp_size=1, pp_size=1, pcp_size=8, tp_size=1, group_size=4
+    )
+    assert ranks_g2 == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    assert ranks_g4 == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    flat_g2 = tuple(r for g in ranks_g2 for r in g)
+    flat_g4 = tuple(r for g in ranks_g4 for r in g)
+    assert flat_g2 == flat_g4 == (0, 1, 2, 3, 4, 5, 6, 7)
+
+    parent = SimpleNamespace(unique_name="pcp-a")
+    key_g2 = _linear_gate_pcp_subgroup_cache_key(parent, ranks_g2)
+    key_g4 = _linear_gate_pcp_subgroup_cache_key(parent, ranks_g4)
+    assert key_g2 != key_g4
+
+
+def test_linear_gate_pcp_subgroup_cache_drops_stale_parent(monkeypatch) -> None:
+    """Replacing the parent PCP group must not reuse the old subgroup object."""
+    import vllm_hcu.models.hy_v4.attention as attention_mod
+
+    clear_linear_gate_pcp_groups()
+    created: list[SimpleNamespace] = []
+
+    def fake_init(group_ranks, local_rank, backend, group_name=None):
+        group = SimpleNamespace(
+            world_size=len(group_ranks[0]),
+            group_ranks=group_ranks,
+            name=group_name,
+        )
+        created.append(group)
+        return group
+
+    parent_a = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-a",
+    )
+    parent_b = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-b",
+    )
+    parallel = SimpleNamespace(
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "2")
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent_a)
+    monkeypatch.setattr(
+        attention_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel),
+    )
+    monkeypatch.setattr(attention_mod.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        attention_mod, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.init_model_parallel_group",
+        fake_init,
+    )
+
+    first = _get_linear_gate_pcp_group()
+    assert first.world_size == 2
+    assert len(created) == 1
+    assert len(_linear_gate_pcp_groups) == 1
+
+    # Same parent + same GROUP_SIZE: cache hit.
+    assert _get_linear_gate_pcp_group() is first
+    assert len(created) == 1
+
+    # New parent after destroy/reinit: must rebuild, not reuse first.
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent_b)
+    second = _get_linear_gate_pcp_group()
+    assert second is not first
+    assert second.world_size == 2
+    assert len(created) == 2
+    clear_linear_gate_pcp_groups()
+
+
+def test_linear_gate_pcp_subgroup_cache_distinguishes_group_size(monkeypatch) -> None:
+    """Switching GROUP_SIZE 2 -> 4 must create a new subgroup, not reuse size-2."""
+    import vllm_hcu.models.hy_v4.attention as attention_mod
+
+    clear_linear_gate_pcp_groups()
+    created: list[SimpleNamespace] = []
+
+    def fake_init(group_ranks, local_rank, backend, group_name=None):
+        group = SimpleNamespace(
+            world_size=len(group_ranks[0]),
+            group_ranks=group_ranks,
+        )
+        created.append(group)
+        return group
+
+    parent = SimpleNamespace(
+        world_size=8,
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        unique_name="pcp-fixed",
+    )
+    parallel = SimpleNamespace(
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+    monkeypatch.setattr(attention_mod, "get_pcp_group", lambda: parent)
+    monkeypatch.setattr(
+        attention_mod,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(parallel_config=parallel),
+    )
+    monkeypatch.setattr(attention_mod.dist, "get_world_size", lambda: 8)
+    monkeypatch.setattr(
+        attention_mod, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.init_model_parallel_group",
+        fake_init,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "2")
+    g2 = _get_linear_gate_pcp_group()
+    assert g2.world_size == 2
+
+    monkeypatch.setenv("VLLM_HCU_LINEAR_GATE_PCP_GROUP_SIZE", "4")
+    g4 = _get_linear_gate_pcp_group()
+    assert g4 is not g2
+    assert g4.world_size == 4
+    assert len(created) == 2
+    clear_linear_gate_pcp_groups()
 
 
 def test_hy_v4_mla_cache_spec_marks_fp8_as_quantized(monkeypatch) -> None:
@@ -208,6 +332,8 @@ def test_pipeline_stage_must_start_with_a_local_full_indexer() -> None:
     "layer_types,indexer_types,start_layer,end_layer,missing_producer",
     [
         (["full_attention", "sparse_attention", "sparse_attention"],
+         ["full", "shared", "shared"], 0, 3, True),
+        (["full_attention", "indexed_attention", "indexed_attention"],
          ["full", "shared", "shared"], 0, 3, True),
         (["sparse_attention", "full_attention", "sparse_attention"],
          ["full", "full", "shared"], 1, 3, True),
@@ -346,24 +472,54 @@ def _bare_impl(sinks: torch.Tensor | None) -> HYV4FlashMLASparseImpl:
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "num_reqs", "expected"),
-    [(8, 2, 4), (8, 8, 1)],
+    ("num_tokens", "num_reqs", "max_query_len", "expected"),
+    [
+        (8, 2, 4, 4),
+        (8, 8, 1, 1),
+        # Chunked prefill can split a fixed token budget unevenly across
+        # requests. LightOp cannot express those widths with its scalar
+        # tokens_per_request argument, so process every row independently.
+        (256, 3, 86, 1),
+        # Divisibility alone does not prove that request widths are uniform.
+        (8, 2, 5, 1),
+    ],
 )
-def test_uniform_tokens_per_request(
+def test_lightop_tokens_per_request(
     num_tokens: int,
     num_reqs: int,
+    max_query_len: int,
     expected: int,
 ) -> None:
-    assert hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs) == expected
+    assert (
+        hcu_sparse._lightop_tokens_per_request(
+            num_tokens,
+            num_reqs,
+            max_query_len,
+        )
+        == expected
+    )
 
 
-@pytest.mark.parametrize(("num_tokens", "num_reqs"), [(7, 2), (8, 0)])
-def test_uniform_tokens_per_request_rejects_invalid_shape(
+@pytest.mark.parametrize(
+    ("num_tokens", "num_reqs", "max_query_len", "error"),
+    [
+        (8, 0, 4, "at least one request"),
+        (1, 1, 0, "positive max_query_len"),
+        (1, 1, -1, "positive max_query_len"),
+    ],
+)
+def test_lightop_tokens_per_request_rejects_invalid_shape(
     num_tokens: int,
     num_reqs: int,
+    max_query_len: int,
+    error: str,
 ) -> None:
-    with pytest.raises(ValueError, match="uniform query width|at least one request"):
-        hcu_sparse._uniform_tokens_per_request(num_tokens, num_reqs)
+    with pytest.raises(ValueError, match=error):
+        hcu_sparse._lightop_tokens_per_request(
+            num_tokens,
+            num_reqs,
+            max_query_len,
+        )
 
 
 def test_fp8_kv_dequant_prefers_lightop_and_passes_mtp3_width(
@@ -635,6 +791,20 @@ def test_lightop_mapping_reuse_only_marks_uniform_target_verify(
     )
 
     assert group_size == expected_group_size
+
+
+def test_lightop_mapping_reuse_rejects_tokens_without_query_width() -> None:
+    metadata = SimpleNamespace(
+        num_reqs=1,
+        max_query_len=0,
+        num_actual_tokens=1,
+    )
+
+    with pytest.raises(ValueError, match="positive max_query_len"):
+        hcu_sparse._lightop_mapping_reuse_group_size(
+            metadata,
+            torch.tensor([False], dtype=torch.bool),
+        )
 
 
 @pytest.mark.parametrize(
@@ -1059,6 +1229,7 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     fp8_cache = torch.zeros(16, 656, dtype=torch.uint8)
     metadata = SimpleNamespace(
         num_reqs=2,
+        max_query_len=1,
         req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
         block_table=torch.tensor([[7], [11]], dtype=torch.int32),
         block_size=64,
@@ -1089,6 +1260,77 @@ def test_fp8_dcp_localizes_dequantizes_and_masks_empty_rows(monkeypatch) -> None
     impl._dcp_sinks = None
     _, sink_free_lse = impl.forward_mqa(q, fp8_cache, metadata, object())
     assert torch.isneginf(sink_free_lse[1]).all()
+
+
+def test_fp8_dcp_ragged_batch_gathers_each_query_row_independently(
+    monkeypatch,
+) -> None:
+    impl = _bare_impl(None)
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 0
+    impl.kv_cache_dtype = "fp8_ds_mla"
+    impl.topk_indices_buffer = torch.arange(20, dtype=torch.int32).view(5, 4)
+
+    localized_indices = torch.arange(100, 120, dtype=torch.int32).view(5, 4)
+    topk_length = torch.full((5,), 4, dtype=torch.int32)
+    compact_indices = torch.arange(20, dtype=torch.int32).view(5, 4)
+    gathered_cache = torch.zeros(20, 576)
+    observed_widths: list[int] = []
+
+    def fake_filter(*args, **kwargs):
+        del args, kwargs
+        return localized_indices, topk_length
+
+    def fake_dequant(
+        cache,
+        indices,
+        kv_lora_rank,
+        rope_dim,
+        tokens_per_request,
+        **kwargs,
+    ):
+        del cache, kv_lora_rank, rope_dim, kwargs
+        assert indices is localized_indices
+        observed_widths.append(tokens_per_request)
+        return gathered_cache, compact_indices
+
+    rowwise_reference = torch.stack(
+        [torch.full((4, 3), float(row)) for row in range(5)]
+    )
+
+    def fake_kernel(self, q, cache, indices, topk_length=None):
+        del self, q
+        assert cache is gathered_cache
+        assert indices is compact_indices
+        assert topk_length is not None
+        return rowwise_reference.clone(), torch.zeros(5, 4)
+
+    monkeypatch.setattr(hcu_sparse, "triton_filter_and_convert_dcp_index", fake_filter)
+    monkeypatch.setattr(
+        hcu_sparse,
+        "gather_dequantize_fp8_ds_mla_cache",
+        fake_dequant,
+    )
+    impl._bf16_flash_mla_kernel_with_lse = MethodType(fake_kernel, impl)
+
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=3,
+        req_id_per_token=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32),
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        block_size=64,
+        cp_kv_cache_interleave_size=1,
+    )
+    output, _ = impl.forward_mqa(
+        torch.zeros(5, 4, 576),
+        torch.zeros(16, 656, dtype=torch.uint8),
+        metadata,
+        object(),
+    )
+
+    assert observed_widths == [1]
+    torch.testing.assert_close(output, rowwise_reference)
 
 
 def test_dcp_size_one_delegates_to_upstream_forward(monkeypatch) -> None:
