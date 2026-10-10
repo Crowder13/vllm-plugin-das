@@ -23,32 +23,47 @@ env:
   HARBOR_SITE: ${{ vars.HARBOR_SITE }}
   HARBOR_NAMESPACE: jenkins/model_test_env
   HCU_CI_IMAGE: ${{ vars.HCU_CI_IMAGE }}
-  # 直接基于预装 DTK 的基础镜像构建, CI 内不再安装 DTK; 换 DTK 包 = 改这一行 tag
-  # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<版本>
-  BASE_IMAGE: ${{ vars.DTK_BASE_IMAGE || format('{0}/hcu/base/dtk:26.04.1-ubuntu22.04-py3.10', vars.HARBOR_SITE) }}
   PYPI_URL: ${{ vars.PYPI_URL }}
   RESOURCE_SERVER_URL: ${{ vars.RESOURCE_SERVER_URL }}
   VLLM_VERSION: "0.25.1"
-  TORCH_VERSION: "2.11.0"
 
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
+    # 加镜像目标 = 改下面矩阵; image/DTK 版本号/输出 tag 全部按矩阵字段拼接,
+    # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<Python版本>
     runs-on: bw1100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dtk_tag: "26.04.1"
+            os_tag: "ubuntu22.04"
+            python_version: "3.10"
+            torch_version: "2.11.0"
+            # AICC run 包 branch 段的 dtk 版本 token, 装该段下日期最新的包
+            dtk_branch: "dtk26042"
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
+    env:
+      # 直接基于预装 DTK 的基础镜像构建, CI 内不再安装 DTK
+      BASE_IMAGE: ${{ vars.DTK_BASE_IMAGE || format('{0}/hcu/base/dtk:{1}-{2}-py{3}', vars.HARBOR_SITE, matrix.dtk_tag, matrix.os_tag, matrix.python_version) }}
+      TORCH_VERSION: ${{ matrix.torch_version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: 生成镜像 tag
         id: gen-tag
+        env:
+          DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
+          DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
           BUILD_TIME=$(date +"%Y%m%d-%H%M")
           BASE_VERSION=$(grep -oP '__version__ = "\K[^"]+' vllm_hcu/version.py)
-          echo "IMAGE_TAG=vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_ENV"
           echo "LATEST_TAG=vllm:${BASE_VERSION}-latest" >> "$GITHUB_ENV"
-          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-ubuntu22.04-dtk26041-py3.10-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+          echo "docker_image=${HARBOR_SITE}/${HARBOR_NAMESPACE}/vllm:${BASE_VERSION}-${{ matrix.os_tag }}-dtk${DTK_TAG_NO_DOT}-py${{ matrix.python_version }}-${BUILD_TIME}" >> "$GITHUB_OUTPUT"
 
       - name: 登录 Harbor
         uses: docker/login-action@v3
@@ -58,7 +73,11 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: 构建镜像
+        env:
+          # nightly 归档路径按 DTK 版本号拼接 (26.04.1 -> dtk26041)
+          DTK_TAG_NO_DOT: ${{ matrix.dtk_tag }}
         run: |
+          DTK_TAG_NO_DOT="${DTK_TAG_NO_DOT//./}"
           FULL_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           FULL_LATEST_TAG="${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
           docker build \
@@ -67,6 +86,8 @@ jobs:
             -t "${FULL_TAG}" \
             -t "${FULL_LATEST_TAG}" \
             --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
+            --build-arg "DTK_VERSION=${DTK_TAG_NO_DOT}" \
+            --build-arg "DTK_BRANCH=${{ matrix.dtk_branch }}" \
             --build-arg "PYPI_URL=${PYPI_URL}" \
             --build-arg "RESOURCE_SERVER_URL=${RESOURCE_SERVER_URL}" \
             --build-arg "VLLM_VERSION=${VLLM_VERSION}" \
@@ -80,8 +101,8 @@ jobs:
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}"
           docker push "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${LATEST_TAG}"
 
-      # 自托管构建机磁盘有限, 推送成功后删除本地镜像释放空间;
-      # 下游 validate-image 会自行从 Harbor 重新拉取, 不依赖本机镜像
+      ## 自托管构建机磁盘有限, 推送成功后删除本地镜像释放空间;
+      ## 多目标并行时 latest 可能被其他矩阵任务覆盖, 删除远端 latest 不安全, 略
       - name: 删除本地镜像
         run: |
           docker rmi "${HARBOR_SITE}/${HARBOR_NAMESPACE}/${IMAGE_TAG}" \
@@ -94,7 +115,7 @@ jobs:
         run: rm -rf "${GITHUB_WORKSPACE}"/* "${GITHUB_WORKSPACE}"/.[!.]* || true
 
   # 镜像推送成功后, 对本次构建的具体镜像并行跑 CItest 与冒烟校验,
-  # 两个测试 job 只依赖 build, 互不等待互不阻断
+  # 两个测试 job 按 build 矩阵展开, 每个镜像独立校验, 互不等待互不阻断
   test-image:
     if: github.event.inputs.run_test != 'false'
     needs: build

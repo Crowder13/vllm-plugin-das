@@ -4,7 +4,9 @@
 # 直接基于预装 DTK 的基础镜像构建 (DTK 已内置于 BASE_IMAGE, CI 内不再安装 DTK):
 #   基础镜像来自镜像总表 ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<版本>,
 #   由 CI 通过 build-arg 按固定格式拼接传入; 换 DTK 包 = 换基础镜像 tag
+# DTK_VERSION 用于拼接内网 pip nightly 归档路径 (如 2604 -> nightly/dtk2604/+simple/)
 ARG BASE_IMAGE
+ARG DTK_VERSION
 
 FROM ${BASE_IMAGE}
 
@@ -19,12 +21,12 @@ SHELL ["/bin/bash", "-c"]
 ARG PYPI_URL
 ARG RESOURCE_SERVER_URL
 
-# pip 配置 + das-install
+# pip 配置 (nightly 归档按 DTK_VERSION 拼接) + das-install
 RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     mkdir -p ~/.pip && \
     printf '%s\n' \
     '[global]' \
-    "index-url = ${PYPI_URL}/nightly/dtk2604/+simple/" \
+    "index-url = ${PYPI_URL}/nightly/dtk${DTK_VERSION}/+simple/" \
     "trusted-host = ${TRUSTED_HOST}" \
     > ~/.pip/pip.conf && \
     pip install --ignore-installed --no-cache-dir blinker && \
@@ -39,12 +41,18 @@ RUN TRUSTED_HOST="${PYPI_URL#*://}" && TRUSTED_HOST="${TRUSTED_HOST%%/*}" && \
     'pip install --no-cache-dir --extra-index-url https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com "$pkg==$ver"' \
     > /usr/local/bin/das-install && chmod +x /usr/local/bin/das-install
 
+# DTK 大版本号写入 ENV, 供运行时识别
+ENV DTK_VERSION=${DTK_VERSION}
+
 COPY requirements-test.txt /tmp/requirements-test.txt
 
-# 安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录
+# AICC 编译器安装 (安装脚本安装成功后会在 $DTK_DIR/hcu_llvm.info 写入本次完整版本/commit 等记录);
+# --dtk 按 run 包 branch 段上的 dtk 版本 token 筛选, 装该段中日期最新的包;
+# token 与基础镜像 ENV DTK_VERSION 的前缀一致 (基础镜像 26.04.1 -> dtk26042, 26.10 -> dtk2610)
+ARG DTK_BRANCH
 RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp/hcu_llvm_installer.sh && \
     chmod +x /tmp/hcu_llvm_installer.sh && \
-    bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
+    bash /tmp/hcu_llvm_installer.sh --dtk "${DTK_BRANCH}" && \
     rm -f /tmp/hcu_llvm_installer.sh
 
 #blas cut / shca / UCX 等均已在基础镜像内就绪 (基础镜像含 blas cut 覆盖与 /opt/ucx),
@@ -93,24 +101,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
 
-# DTK 环境变量: 固化 env.sh 的导出(外加 bashrc 追加的 amdsmi 路径), 使 docker run 直接给命令 / sh /
-# k8s 等非交互 bash 场景也能加载; bashrc 保留作兜底(驱动缺失时 env.sh 的 .hyhal 分支只有 source 才命中)。
-# 放在文件末尾: 不改动其上方各构建步骤所见的环境。换 DTK 包后对照新 env.sh 同步这里(参考 ciimage「DTK 环境变量」)
-ENV HYHAL_PATH=/opt/hyhal
-ENV DTKROOT=${ROCM_PATH}
-ENV AMDGPU_TARGETS="gfx906;gfx926;gfx928;gfx936;gfx938"
-ENV HIP_PATH=${ROCM_PATH}/hip
-ENV MIOPEN_FIND_MODE=3
-ENV CMAKE_PREFIX_PATH=/opt/hyhal:$CMAKE_PREFIX_PATH
-ENV PATH=${ROCM_PATH}/bin:${ROCM_PATH}/llvm/bin:${ROCM_PATH}/hip/bin:${ROCM_PATH}/hip/bin/hipify:${HYHAL_PATH}/bin:${ROCM_PATH}/opencl/bin:$PATH
-ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:${ROCM_PATH}/lib64:${HYHAL_PATH}/lib:${HYHAL_PATH}/lib64:${ROCM_PATH}/dushmem/lib:${ROCM_PATH}/opencl/lib:$LD_LIBRARY_PATH
-ENV LD_LIBRARY_PATH=${ROCM_PATH}/dcc/gcvm/lib:${ROCM_PATH}/hip/lib:${ROCM_PATH}/llvm/lib:$LD_LIBRARY_PATH
-ENV LIBRARY_PATH=${HYHAL_PATH}/lib:${ROCM_PATH}/opencl/lib:${ROCM_PATH}/dushmem/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}
-ENV C_INCLUDE_PATH=${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/opencl/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}
-ENV C_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}
-ENV CPLUS_INCLUDE_PATH=${ROCM_PATH}/dcc/gcvm/include:${C_INCLUDE_PATH}:${ROCM_PATH}/include:${HYHAL_PATH}/include:${ROCM_PATH}/llvm/include:${ROCM_PATH}/dushmem/include:${ROCM_PATH}/opencl/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}
-ENV LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH
-
+# DTK 环境变量已由基础镜像固化 (HYHAL_PATH/DTKROOT/PATH/LD_LIBRARY_PATH 等), 不再在此重复
 # 镜像完整引用由 CI 构建时通过 --build-arg 传入, 注入 ENV 便于容器运行时读取
 ARG IMAGE_TAG
 ENV IMAGE_TAG=${IMAGE_TAG}
