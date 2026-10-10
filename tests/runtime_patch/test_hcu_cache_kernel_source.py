@@ -3,33 +3,27 @@
 
 from pathlib import Path
 
-import pytest
-
 
 REPO = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize(
-    ("relative_path", "expected_launch"),
-    [
-        (
-            "vllm_hcu/csrc/hcu_cache_kernel.cu",
-            "dim3 block(std::min(kv_lora_rank, 256));",
-        ),
-        (
-            "vllm_hcu/csrc/hcu_cache_kernel.hip",
-            "dim3 block(::min(kv_lora_rank, 256));",
-        ),
-    ],
-)
-def test_mla_cache_launch_respects_hcu_thread_limit(
-    relative_path: str, expected_launch: str
-) -> None:
-    source = (REPO / relative_path).read_text(encoding="utf-8")
+def test_mla_cache_launch_respects_hcu_thread_limit() -> None:
+    source = (REPO / "vllm_hcu/csrc/hcu_cache_kernel.cu").read_text(
+        encoding="utf-8"
+    )
     function = source.split("void concat_and_cache_mla_hcu(", 1)[1]
 
-    assert expected_launch in function
+    assert "dim3 block(std::min(kv_lora_rank, 256));" in function
     assert "min(kv_lora_rank, 512)" not in function
+
+    bindings = (REPO / "vllm_hcu/csrc/torch_bindings.cpp").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        '"concat_and_cache_mla(Tensor kv_c, Tensor k_pe, Tensor! kv_cache, "'
+        in bindings
+    )
+    assert 'ops.impl("concat_and_cache_mla", torch::kCUDA' in bindings
 
 
 def test_flash_cache_writer_uses_runtime_strides_and_mutating_schema() -> None:

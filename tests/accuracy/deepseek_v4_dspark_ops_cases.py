@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Live gfx938 numerical cases collected by the unified AITER test module."""
+"""Live DeepSeek-V4 numerical cases with architecture-specific gates."""
 
 from __future__ import annotations
 
@@ -14,13 +14,17 @@ import torch.nn.functional as functional
 pytestmark = pytest.mark.hcu
 
 
-def _hcu_device() -> torch.device:
+def _hcu_device(*, allow_gfx936: bool = False) -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("a live HCU/ROCm device is required")
     properties = torch.cuda.get_device_properties(0)
     arch = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
-    if arch != "gfx938":
-        pytest.skip(f"DeepSeek-V4 DeepGEMM checks require gfx938, got {arch!r}")
+    supported_arches = {"gfx938"}
+    if allow_gfx936:
+        supported_arches.add("gfx936")
+    if arch not in supported_arches:
+        supported = " or ".join(sorted(supported_arches))
+        pytest.skip(f"DeepSeek-V4 operator check requires {supported}, got {arch!r}")
     return torch.device("cuda", 0)
 
 
@@ -124,7 +128,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
         device=device,
         dtype=torch.float32,
     ).add_(0.01)
-    hipc_scale = checkpoint_scale * 16.0
+    hipc_scale = checkpoint_scale
 
     layer = torch.nn.Module()
     layer.w13_weight = torch.nn.Parameter(canonical_w13, requires_grad=False)
@@ -196,7 +200,7 @@ def test_auto_w4a8_shared_storage_feeds_ht_and_ll_with_empty_expert() -> None:
 
     unpacked_w13 = _unpack_signed_int4_high_low(raw_w13)
     reference = (activation.float() * activation_scale) @ (
-        unpacked_w13[0].float() * hipc_scale[0]
+        unpacked_w13[0].float() * (checkpoint_scale[0] * 16.0)
     ).T
     torch.testing.assert_close(ht_output.float(), reference, rtol=3e-2, atol=0.1)
     torch.testing.assert_close(
@@ -554,7 +558,7 @@ def test_lightop_int8_clamped_silu_quant_matches_vllm_for_ht_and_ll() -> None:
 def test_dspark_non_pcp_lightop_context_insert_writes_fp8_cache() -> None:
     from vllm_hcu.models.deepseek_v4_dspark import _insert_context_kv
 
-    device = _hcu_device()
+    device = _hcu_device(allow_gfx936=True)
     num_tokens, head_dim, block_size, num_blocks = 3, 512, 4, 2
     generator = torch.Generator(device=device).manual_seed(736)
     positions = torch.tensor([0, 1, 5], device=device, dtype=torch.int32)
@@ -619,7 +623,7 @@ def test_dspark_non_pcp_lightop_context_insert_matches_vllm_reference() -> None:
     )
     from vllm_hcu.models.deepseek_v4_dspark import _insert_context_kv
 
-    device = _hcu_device()
+    device = _hcu_device(allow_gfx936=True)
     num_tokens, head_dim, block_size, num_blocks = 17, 512, 64, 2
     generator = torch.Generator(device=device).manual_seed(737)
     positions = torch.tensor(

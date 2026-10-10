@@ -452,7 +452,7 @@ def test_v0251_native_mhc_contract_is_not_replaced():
     } <= exports
 
 
-def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
+def test_v0251_native_hcu_deepseek_v4_uses_narrow_mtp_loader_adapter():
     exchanges = dict(module_exchange_names())
     assert "vllm.v1.attention.backends.mla.sparse_swa" in exchanges
     assert {
@@ -465,7 +465,11 @@ def test_v0251_native_hcu_deepseek_v4_owns_model_and_mtp_contracts():
         REPO_ROOT / "vllm_hcu/models/__init__.py"
     ).read_text(encoding="utf-8")
     assert '"DeepseekV4ForCausalLM"' not in hcu_registry
-    assert '"DeepSeekV4MTPModel"' not in hcu_registry
+    assert '"DeepSeekV4MTPModel"' in hcu_registry
+    assert (
+        '"vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP"'
+        in hcu_registry
+    )
 
     target_registry_tree = ast.parse(
         (
@@ -587,14 +591,21 @@ def test_aiter_replacement_preserves_v0251_public_method_surface_and_ar_lifecycl
         "destroy_aiter_allreduce",
         "get_aiter_allreduce_max_size",
     }.isdisjoint(replacement_methods)
-    for method_name in (
-        "refresh_env_variables",
-        "is_custom_all_reduce_enabled",
-        "get_aiter_allreduce",
-    ):
+    for method_name in ("refresh_env_variables",):
         assert ast.dump(
             replacement_methods[method_name], include_attributes=False
         ) == ast.dump(target_methods[method_name], include_attributes=False)
+
+    # These HCU capability bodies intentionally add only the process-wide
+    # custom-op master policy while retaining the upstream signatures and
+    # decorators checked above.
+    for method_name in (
+        "is_linear_enabled",
+        "is_custom_all_reduce_enabled",
+        "get_aiter_allreduce",
+    ):
+        method_source = ast.unparse(replacement_methods[method_name])
+        assert "henvs.custom_ops_enabled()" in method_source, method_name
 
 
 def test_sparse_indexer_replacement_keeps_v0251_q_rope_quant_contract():

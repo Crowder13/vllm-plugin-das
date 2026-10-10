@@ -105,6 +105,41 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
         with deepep_auto_request_phase_scope():
             return super().execute_model(*args, **kwargs)
 
+    def profile_run(self) -> None:
+        """Profile PCP with the per-rank token budget plus routing slack."""
+
+        pcp_size = int(
+            self.vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        # Upstream profiles the target and MTP prefill from the same dummy
+        # batch. Runtime MTP sampling restores the global PCP batch before
+        # propose(), so shrinking this shared budget would under-profile the
+        # replicated draft prefill even though it is safe for the target.
+        if pcp_size <= 1 or getattr(self, "speculator", None) is not None:
+            return super().profile_run()
+
+        original_max = self.max_num_tokens
+        # Prefill tokens are partitioned, but decode tokens are replicated on
+        # every PCP rank. A prefill request can also occupy two
+        # DualChunkSwap segments, so reserve two tokens of per-request layout
+        # headroom when that exceeds the decode width. This bounds every
+        # rank-local mix while retaining the 12.5% prefill imbalance slack.
+        partitioned_tokens = (
+            (original_max + pcp_size - 1) // pcp_size
+        ) * 9 // 8
+        replicated_request_tokens = min(
+            original_max,
+            int(self.max_num_reqs) * max(int(self.decode_query_len), 2),
+        )
+        self.max_num_tokens = min(
+            original_max,
+            max(1, partitioned_tokens + replicated_request_tokens),
+        )
+        try:
+            return super().profile_run()
+        finally:
+            self.max_num_tokens = original_max
+
     def prepare_attn(self, input_batch):
         if self.pcp_manager is None:
             return super().prepare_attn(input_batch)
@@ -137,7 +172,12 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             and execute_model_state is not None
             and getattr(self, "speculator", None) is not None
         )
-        if use_replicated_mtp_batch:
+        restore_nonfinal_pp_batch = (
+            self.pcp_manager is not None
+            and execute_model_state is not None
+            and not getattr(self, "is_last_pp_rank", True)
+        )
+        if use_replicated_mtp_batch or restore_nonfinal_pp_batch:
             (
                 restored_hidden_states,
                 restored_input_batch,
@@ -193,7 +233,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 finally:
                     self.pcp_manager = pcp_manager
             else:
-                # Current upstream owns the ordinary PCP restore lifecycle.
+                # Upstream restores PCP only on the final PP stage. Non-final
+                # ranks need the global batch restored before PP receive.
                 output = super().sample_tokens(grammar_output)
         return output
 

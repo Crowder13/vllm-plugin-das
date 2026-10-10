@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import sys
 from importlib.machinery import ModuleSpec
 from types import ModuleType, SimpleNamespace
@@ -17,6 +18,27 @@ from vllm_hcu.patch.worker.op_opt import patch_triton_unified_attention
 from vllm_hcu.platforms import envs as hcu_envs
 
 
+_TEST_FLASH_ATTN_VERSION = "2.8.4+dtk2604.torch2110.2609241509.g624d7b"
+
+
+def _stub_flash_attn_distribution(
+    monkeypatch: pytest.MonkeyPatch,
+    flash_attn_extension: ModuleType,
+    version: str = _TEST_FLASH_ATTN_VERSION,
+) -> None:
+    """Keep CPU kernel doubles independent of the installed vendor wheel."""
+
+    flash_attn_extension.__version__ = version
+    distribution_version = importlib.metadata.version
+
+    def version_for_test(distribution_name: str) -> str:
+        if distribution_name == "flash_attn":
+            return version
+        return distribution_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", version_for_test)
+
+
 def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
     hcu_ops = ModuleType("vllm_hcu.hcu_ops")
     hcu_ops.__spec__ = ModuleSpec(hcu_ops.__name__, loader=None)
@@ -27,6 +49,8 @@ def _load_hcu_flash_attention_module(monkeypatch: pytest.MonkeyPatch):
         flash_attn_extension.__name__,
         loader=None,
     )
+    _stub_flash_attn_distribution(monkeypatch, flash_attn_extension)
+
     def layout_entrypoint(
         q=None,
         k=None,
@@ -56,6 +80,8 @@ def _load_hcu_fa_utils_module(
     *,
     kv_cache_layout: str,
     missing_layout_on: str | None = None,
+    flash_attn_varlen_override=None,
+    flash_attn_version: str = _TEST_FLASH_ATTN_VERSION,
 ):
     """Load the real HCU FA boundary against observable kernel doubles."""
 
@@ -76,6 +102,11 @@ def _load_hcu_fa_utils_module(
     flash_attn_extension.__spec__ = ModuleSpec(
         flash_attn_extension.__name__,
         loader=None,
+    )
+    _stub_flash_attn_distribution(
+        monkeypatch,
+        flash_attn_extension,
+        flash_attn_version,
     )
 
     def make_entrypoint(name: str):
@@ -105,7 +136,14 @@ def _load_hcu_fa_utils_module(
         "hg_flash_attn_varlen_func",
         "varlen_fwd_unified",
     ):
-        setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
+        if (
+            symbol == "flash_attn_varlen_func"
+            and flash_attn_varlen_override is not None
+        ):
+            calls[symbol] = []
+            setattr(flash_attn_extension, symbol, flash_attn_varlen_override)
+        else:
+            setattr(flash_attn_extension, symbol, make_entrypoint(symbol))
     monkeypatch.setitem(sys.modules, flash_attn_extension.__name__, flash_attn_extension)
     monkeypatch.delitem(
         sys.modules,
@@ -115,6 +153,35 @@ def _load_hcu_fa_utils_module(
 
     module = importlib.import_module("vllm_hcu.v1.attention.backends.fa_utils")
     return module, calls
+
+
+def test_hcu_flash_attention_loader_stubs_vendor_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The CPU contract loader must not require an installed vendor wheel."""
+
+    real_version = importlib.metadata.version
+
+    def missing_distribution(distribution_name: str):
+        if distribution_name == "flash_attn":
+            raise importlib.metadata.PackageNotFoundError(distribution_name)
+        return real_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_distribution)
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.flash_attn",
+        raising=False,
+    )
+    monkeypatch.delitem(
+        sys.modules,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        raising=False,
+    )
+
+    module = _load_hcu_flash_attention_module(monkeypatch)
+
+    assert module.__name__ == "vllm_hcu.v1.attention.backends.flash_attn"
 
 
 @pytest.mark.parametrize(
@@ -154,6 +221,194 @@ def test_hcu_fa_boundary_rejects_interface_without_layout(
             kv_cache_layout="HND",
             missing_layout_on="hg_flash_attn_varlen_func",
         )
+
+
+@pytest.mark.parametrize(
+    "incompatible_version",
+    [
+        "2.8.4",
+        "2.8.4+dtk2604.torch2110.2609200000.g111111",
+        "2.8.4+foo",
+        "2.8.4+dtk2605.torch2110.2609010000.g999999",
+    ],
+)
+def test_hcu_fa_boundary_rejects_vendor_build_without_known_gather_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    incompatible_version: str,
+) -> None:
+    with pytest.raises(RuntimeError, match="native long-prefill gather fix"):
+        _load_hcu_fa_utils_module(
+            monkeypatch,
+            kv_cache_layout="HND",
+            flash_attn_version=incompatible_version,
+        )
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("positional", [False, True])
+def test_hcu_fa_boundary_exposes_native_page_axes_without_copy(
+    monkeypatch, layout, dtype, positional,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout=layout,
+    )
+    physical_shape = (3, 2, 64, 8) if layout == "HND" else (3, 64, 2, 8)
+    physical = torch.linspace(-2, 2, 3072).reshape(physical_shape).to(dtype)
+    key = physical.transpose(1, 2) if layout == "HND" else physical
+    value = key.clone()
+    original_stride = key.stride()
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    wrapped = fa_utils._with_kv_cache_layout(vendor, "probe")
+    if positional:
+        actual_key, actual_value, actual_layout = wrapped(None, key, value, "bshd")
+    else:
+        actual_key, actual_value, actual_layout = wrapped(q=None, k=key, v=value)
+
+    assert actual_layout == ("bhsd" if layout == "HND" else "bshd")
+    assert tuple(actual_key.shape) == physical_shape
+    assert tuple(actual_value.shape) == physical_shape
+    assert actual_key.data_ptr() == key.data_ptr()
+    assert actual_value.data_ptr() == value.data_ptr()
+    assert actual_key.dtype == actual_value.dtype == dtype
+    torch.testing.assert_close(actual_key.float(), physical.float(), rtol=0, atol=0)
+    torch.testing.assert_close(actual_value.float(), physical.float(), rtol=0, atol=0)
+    assert tuple(key.shape) == (3, 64, 2, 8)
+    assert key.stride() == original_stride
+
+
+def test_hcu_fa_boundary_uses_bshd_compat_view_for_hnd_128_pages(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    physical = torch.linspace(-2, 2, 3 * 2 * 128 * 8).reshape(3, 2, 128, 8)
+    logical = physical.transpose(1, 2)
+
+    def vendor(q, k, v, layout="bshd"):
+        return k, v, layout
+
+    actual_key, actual_value, actual_layout = fa_utils._with_kv_cache_layout(
+        vendor, "probe"
+    )(q=None, k=logical, v=logical)
+
+    assert actual_layout == "bshd"
+    assert actual_key.shape == logical.shape
+    assert actual_value.shape == logical.shape
+    assert actual_key.stride() == logical.stride()
+    assert actual_value.stride() == logical.stride()
+    assert actual_key.data_ptr() == physical.data_ptr()
+    assert actual_value.data_ptr() == physical.data_ptr()
+
+
+def test_hcu_fa_boundary_supplies_global_descales_for_hnd_128_fp8_cache(
+    monkeypatch,
+):
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch, kv_cache_layout="HND",
+    )
+    logical = torch.zeros(
+        3, 2, 128, 8, dtype=torch.float8_e5m2
+    ).transpose(1, 2)
+    k_descale = torch.tensor(0.25).expand(3, 2)
+    v_descale = torch.tensor(0.75).expand(3, 2)
+
+    def vendor(
+        q,
+        k,
+        v,
+        layout="bshd",
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    ):
+        return layout, q_descale, k_descale, v_descale
+
+    layout, q_descale, actual_k_descale, actual_v_descale = (
+        fa_utils._with_kv_cache_layout(vendor, "probe")(
+            q=torch.zeros(1, 4, 8),
+            k=logical,
+            v=logical,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    )
+
+    assert layout == "bshd"
+    torch.testing.assert_close(q_descale, torch.ones(1))
+    torch.testing.assert_close(actual_k_descale, torch.tensor([0.25]))
+    torch.testing.assert_close(actual_v_descale, torch.tensor([0.75]))
+    assert q_descale.numel() == 1
+    assert actual_k_descale.numel() == 1
+    assert actual_v_descale.numel() == 1
+    assert actual_k_descale.untyped_storage().data_ptr() == (
+        k_descale.untyped_storage().data_ptr()
+    )
+    assert actual_v_descale.untyped_storage().data_ptr() == (
+        v_descale.untyped_storage().data_ptr()
+    )
+
+
+def test_hcu_fa_boundary_preserves_nonpaged_kv_axes(monkeypatch):
+    fa_utils, _ = _load_hcu_fa_utils_module(monkeypatch, kv_cache_layout="HND")
+    key = torch.zeros(64, 2, 8)
+    value = torch.ones_like(key)
+
+    def vendor(q, k, v, *, layout="bshd"):
+        return k, v
+
+    result = fa_utils._with_kv_cache_layout(vendor, "probe")(
+        q=None, k=key, v=value,
+    )
+    assert result[0] is key
+    assert result[1] is value
+
+
+def test_hcu_cache_layout_survives_worker_initialization_context(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "NHD")
+    cache = CacheConfig()
+    cache.kv_cache_layout = "LBHNC"
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "HND"
+    # Worker forwards and Graph capture do not require a global config context.
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
+
+
+def test_hcu_cache_layout_uses_new_resolved_worker_config(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    for resolved, expected in (("LBHNC", "HND"), ("LBNHC", "NHD")):
+        cache = CacheConfig()
+        cache.kv_cache_layout = resolved
+        with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+            assert layouts.get_kv_cache_layout() == expected
+        with set_current_vllm_config(None):
+            assert layouts.get_kv_cache_layout() == expected
+
+
+def test_hcu_cache_layout_does_not_latch_an_unresolved_default(monkeypatch):
+    from vllm.config import CacheConfig, set_current_vllm_config
+    from vllm_hcu.v1.attention import kv_cache_layout as layouts
+
+    monkeypatch.setattr(layouts, "_worker_kv_cache_layout", None, raising=False)
+    cache = CacheConfig()
+    with set_current_vllm_config(SimpleNamespace(cache_config=cache)):
+        assert layouts.get_kv_cache_layout() == "NHD"
+        cache.kv_cache_layout = "LBHNC"
+        assert layouts.get_kv_cache_layout() == "HND"
+    with set_current_vllm_config(SimpleNamespace(cache_config=CacheConfig())):
+        assert layouts.get_kv_cache_layout() == "NHD"
+    with set_current_vllm_config(None):
+        assert layouts.get_kv_cache_layout() == "HND"
 
 
 def test_pp_size_one_ignores_invalid_manual_partition(monkeypatch: pytest.MonkeyPatch):
@@ -289,6 +544,52 @@ def test_flash_attention_prefers_vendor_kernel_page_size(
     assert backend.get_preferred_block_size(16) == expected_block_size
 
 
+def test_flash_attention_kernel_block_sizes_do_not_require_current_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV-cache planning queries this outside model-construction context."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+
+    sizes = backend.get_supported_kernel_block_sizes()
+
+    assert len(sizes) == 1
+    assert isinstance(sizes[0], flash_attn.MultipleOf)
+    assert sizes[0].base == 16
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_kernel_block_size"),
+    [("varlen", 64), ("cutlass", 64), ("classic", 128)],
+)
+def test_hybrid_flash_attention_splits_manager_pages_to_vendor_kernel_size(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_kernel_block_size: int,
+) -> None:
+    from vllm.v1.worker.utils import select_common_block_size
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+    monkeypatch.setattr(flash_attn, "_get_flash_attn_mode", lambda: mode)
+    monkeypatch.setattr(
+        flash_attn,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(
+            model_config=SimpleNamespace(is_hybrid=True),
+            cache_config=SimpleNamespace(
+                mamba_ssm_cache_dtype="float32",
+                mamba_cache_dtype="float32",
+            ),
+        ),
+    )
+
+    assert select_common_block_size(2176, [backend]) == expected_kernel_block_size
+
+
 def test_cutlass_block_first_hnd_stride_contract(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -402,6 +703,50 @@ def test_flash_cache_writer_dispatches_by_physical_layout(
     assert calls[0][1][:5] == (key, value, key_cache, value_cache, slots)
 
 
+@pytest.mark.parametrize(
+    ("requested_dtype", "operator_dtype"),
+    [
+        ("bfloat16", "auto"),
+        ("float16", "auto"),
+        ("fp8_e5m2", "fp8_e5m2"),
+    ],
+)
+def test_flash_cache_writer_normalizes_explicit_unquantized_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_dtype: str,
+    operator_dtype: str,
+) -> None:
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout="NHD",
+    )
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        torch.ops.hcu_ops,
+        "reshape_and_cache_flash",
+        lambda *args: calls.append(args),
+        raising=False,
+    )
+
+    tensor = torch.zeros(1, 1, 8)
+    cache = torch.zeros(1, 1, 1, 8)
+    slots = torch.tensor([0])
+    scale = torch.tensor(1.0)
+    fa_utils.reshape_and_cache_flash(
+        tensor,
+        tensor,
+        cache,
+        cache,
+        slots,
+        requested_dtype,
+        scale,
+        scale,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][5] == operator_dtype
+
+
 def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -421,6 +766,32 @@ def test_hcu_flash_attention_mm_prefix_is_explicitly_fail_closed(
         device_capability=flash_attn.DeviceCapability(9, 0),
     )
     assert reason is not None and "mm_prefix" in reason
+
+
+def test_hcu_flash_attention_accepts_e5m2_sliding_window_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejecting this contract prevents Step-3.7 from constructing layers."""
+
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    backend = flash_attn.HcuFlashAttentionBackend
+
+    reasons = backend.validate_configuration(
+        head_size=128,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e5m2",
+        block_size=None,
+        use_mla=False,
+        has_sink=False,
+        use_sparse=False,
+        use_mm_prefix=False,
+        use_per_head_quant_scales=False,
+        device_capability=flash_attn.DeviceCapability(9, 0),
+        attn_type=flash_attn.AttentionType.DECODER,
+        has_sliding_window=True,
+    )
+
+    assert reasons == []
 
 
 def test_hcu_flash_attention_rswa_is_explicitly_fail_closed(
@@ -1212,45 +1583,48 @@ def test_unified_attention_proxy_forces_single_stage_and_preserves_other_kwargs(
     ]
 
 
-def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e5m2])
+@pytest.mark.parametrize("with_output", [False, True])
+@pytest.mark.parametrize("with_lse", [False, True])
+def test_flash_attention_long_chunked_prefill_uses_vendor_paged_gather(
     monkeypatch,
+    layout,
+    cache_dtype,
+    with_output,
+    with_lse,
 ) -> None:
-    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+    vendor_calls = []
 
-    calls: dict[str, object] = {}
+    def vendor(q, k, v, *, layout="bshd", **kwargs):
+        vendor_calls.append({"q": q, "k": k, "v": v, "layout": layout, **kwargs})
 
-    def fake_official_gather(
-        key_source,
-        value_source,
-        key_output,
-        value_output,
-        block_table,
-        seq_lens,
-        cu_seqlens_k,
-        max_seqlen,
-    ) -> None:
-        calls["source_shapes"] = (key_source.shape, value_source.shape)
-        calls["output_shapes"] = (key_output.shape, value_output.shape)
-        calls["cu_seqlens_k"] = cu_seqlens_k.clone()
-        calls["max_seqlen"] = max_seqlen
+    fa_utils, _ = _load_hcu_fa_utils_module(
+        monkeypatch,
+        kv_cache_layout=layout,
+        flash_attn_varlen_override=vendor,
+    )
 
-    def fake_flash_attn(**kwargs):
-        calls["flash_kwargs"] = kwargs
-        return "flash-result"
-
-    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
-    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
+    expected_layout = "bhsd" if layout == "HND" else "bshd"
     monkeypatch.setattr(
         fa_utils,
         "_gather_paged_kv",
-        fake_official_gather,
+        lambda *args, **kwargs: pytest.fail("unexpected plugin KV gather"),
+        raising=False,
     )
     query = torch.zeros((37, 8, 128), dtype=torch.bfloat16)
-    packed_cache = torch.zeros((144, 2, 64, 256), dtype=torch.bfloat16)
+    physical_shape = (
+        (144, 2, 64, 256) if layout == "HND" else (144, 64, 2, 256)
+    )
+    physical_cache = torch.zeros(physical_shape, dtype=cache_dtype)
+    packed_cache = (
+        physical_cache.transpose(1, 2) if layout == "HND" else physical_cache
+    )
     key_cache, value_cache = packed_cache.split(128, dim=-1)
     seq_lens = torch.tensor([8421], dtype=torch.int32)
     cu_seqlens_q = torch.tensor([0, 37], dtype=torch.int32)
     block_table = torch.arange(144, dtype=torch.int32).unsqueeze(0)
+    output = torch.empty_like(query) if with_output else None
 
     result = fa_utils.flash_attn_varlen_func(
         q=query,
@@ -1261,61 +1635,69 @@ def test_flash_attention_long_chunked_prefill_gathers_with_full_kv_capacity(
         max_seqlen_k=8421,
         seqused_k=seq_lens,
         block_table=block_table,
+        out=output,
+        return_softmax_lse=with_lse,
     )
 
-    assert result == "flash-result"
-    assert calls["source_shapes"] == (
-        torch.Size([144, 64, 2, 128]),
-        torch.Size([144, 64, 2, 128]),
-    )
-    assert calls["output_shapes"] == (
-        torch.Size([8421, 2, 128]),
-        torch.Size([8421, 2, 128]),
-    )
-    assert calls["cu_seqlens_k"].tolist() == [0, 8421]
-    assert calls["max_seqlen"] == 8421
-    forwarded = calls["flash_kwargs"]
-    assert isinstance(forwarded, dict)
-    assert forwarded["block_table"] is None
-    assert forwarded["seqused_k"] is None
-    assert forwarded["cu_seqlens_k"].shape == (2,)
+    assert result is None
+    assert len(vendor_calls) == 1
+    forwarded = vendor_calls[0]
+    assert forwarded["q"] is query
+    assert forwarded["block_table"] is block_table
+    assert forwarded["seqused_k"] is seq_lens
+    assert forwarded["out"] is output
+    assert forwarded["return_softmax_lse"] is with_lse
+    assert forwarded["layout"] == expected_layout
+    for name, original in (("k", key_cache), ("v", value_cache)):
+        native = forwarded[name]
+        assert (
+            native.untyped_storage().data_ptr()
+            == original.untyped_storage().data_ptr()
+        )
+        if layout == "HND":
+            assert native.shape == (144, 2, 64, 128)
+            assert native.stride() == original.transpose(1, 2).stride()
+        else:
+            assert native is original
 
 
-def test_flash_attention_normal_chunked_prefill_keeps_vendor_paged_path(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected_query_dtype"),
+    [("fp8_e5m2", torch.bfloat16), ("fp8_e4m3", torch.float8_e4m3fn)],
+)
+def test_hcu_flash_attention_e5m2_keeps_compute_dtype_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: str,
+    expected_query_dtype: torch.dtype,
 ) -> None:
-    import vllm_hcu.v1.attention.backends.fa_utils as fa_utils
+    from vllm_hcu.model_executor.layers.attention_forward_runtime import attention_forward
 
-    calls = []
-
-    def fake_flash_attn(**kwargs):
-        calls.append(kwargs)
-        return "vendor-result"
-
-    monkeypatch.setattr(fa_utils, "_flash_attn_layout", lambda: "bhsd")
-    monkeypatch.setattr(fa_utils, "_flash_attn_varlen_func", fake_flash_attn)
-    monkeypatch.setattr(
-        fa_utils,
-        "_gather_paged_kv",
-        lambda *args, **kwargs: pytest.fail("unexpected Triton KV gather"),
-    )
-    query = torch.zeros((75, 8, 128), dtype=torch.bfloat16)
-    packed_cache = torch.zeros((72, 2, 64, 256), dtype=torch.bfloat16)
-    key_cache, value_cache = packed_cache.split(128, dim=-1)
-    block_table = torch.arange(72, dtype=torch.int32).unsqueeze(0)
-    seq_lens = torch.tensor([4171], dtype=torch.int32)
-
-    result = fa_utils.flash_attn_varlen_func(
-        q=query,
-        k=key_cache,
-        v=value_cache,
-        cu_seqlens_q=torch.tensor([0, 75], dtype=torch.int32),
-        max_seqlen_q=75,
-        max_seqlen_k=4171,
-        seqused_k=seq_lens,
-        block_table=block_table,
+    flash_attn = _load_hcu_flash_attention_module(monkeypatch)
+    monkeypatch.setattr(flash_attn, "get_flash_attn_version", lambda **kwargs: 3)
+    monkeypatch.setattr(flash_attn, "get_current_vllm_config_or_none", lambda: None)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_fp8", lambda: True)
+    monkeypatch.setattr(flash_attn, "flash_attn_supports_quant_query_input", lambda: True)
+    impl = flash_attn.FlashAttentionImpl(
+        num_heads=1, head_size=64, scale=0.125, num_kv_heads=1,
+        alibi_slopes=None, sliding_window=None, kv_cache_dtype=cache_dtype,
     )
 
-    assert result == "vendor-result"
-    assert calls[0]["block_table"] is block_table
-    assert calls[0]["seqused_k"] is seq_lens
+    def consume(query, key, value, output, layer_name, **kwargs):
+        # Vendor E5M2 KV accepts compute-dtype queries, not the E4M3
+        # queries produced by the platform-wide upstream quantizer.
+        assert query.dtype == expected_query_dtype
+        output.copy_(query.to(output.dtype))
+
+    layer = SimpleNamespace(
+        impl=impl,
+        query_quant=lambda query, scale: (query.to(torch.float8_e4m3fn), scale),
+        _q_scale=torch.tensor(1.0),
+        num_heads=1, num_kv_heads=1, head_size=64, head_size_v=64,
+        layer_name="layer", kv_cache_dtype=cache_dtype,
+        attn_backend=SimpleNamespace(forward_includes_kv_cache_update=True),
+        kv_sharing_target_layer_name=None, use_direct_call=True,
+    )
+    upstream = SimpleNamespace(unified_attention_with_output=consume)
+    query = torch.full((2, 64), 1.25, dtype=torch.bfloat16)
+    output = attention_forward(upstream, layer, query, query, query)
+    torch.testing.assert_close(output, query)

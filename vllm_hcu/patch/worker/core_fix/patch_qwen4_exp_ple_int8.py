@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
-"""Add HCU compressed-tensors INT8 support for Qwen4Exp PLE embeddings.
+"""Add HCU INT8 and SlimQuant unquantized PLE CPU storage support.
 
 The vLLM snapshot used by HCU still constructs the AMD Qwen4Exp PLE table as
 an unquantized ``PLEVocabParallelEmbedding``.  This patch keeps that model
 implementation intact and replaces only the module-local PLE storage class
 and its shard loader at worker startup.
 
-When EngramConfig.cpu_offload is enabled, the INT8 PLE weights are allocated
-in CPU pinned memory instead of GPU. The legacy VLLM_HCU_PLE_CPU_OFFLOAD
+When EngramConfig.cpu_offload is enabled, INT8 and SlimQuant BF16 PLE weights
+are allocated in CPU pinned memory instead of GPU. The legacy VLLM_HCU_PLE_CPU_OFFLOAD
 environment variable remains a fallback when EngramConfig is omitted. The
 offload path requires the HCU UVA bridge and fails during model initialization
 when that bridge is unavailable.
+
+SlimQuant checkpoints may keep the PLE ngram table INT8 (declared in the
+checkpoint's ``mixed_precision.ngram_embedding`` entry, consumed via
+``SlimQuantW4A8Int8Config``); such tables select the compressed-tensors
+INT8 storage so their per-shard ``weight_scale`` entries load correctly.
 """
 
 from __future__ import annotations
@@ -88,6 +93,27 @@ def _is_compressed_tensors_int8(quant_config, prefix: str) -> bool:
 def _should_offload_ple_to_cpu() -> bool:
     """Resolve PLE CPU offload from EngramConfig or the HCU legacy flag."""
     return cpu_offload_enabled()
+
+
+def _slimquant_ngram_is_int8(quant_config) -> bool:
+    """Check the effective SlimQuant config's declared PLE ngram quantization.
+
+    SlimQuant checkpoints describe mixed-precision tables in the config dict
+    that vLLM's ``get_quant_config`` selects (top-level
+    ``quantization_config``, then ``text_config.quantization_config``, then
+    ``compression_config``) and hands to
+    ``SlimQuantW4A8Int8Config.from_config``, which stores the parsed
+    ``ngram_embedding`` entry on the resolved config object. Reading the
+    entry from that object inherits the config-source priority instead of
+    re-deriving it from ``hf_config``.
+    """
+    entry = getattr(quant_config, "ngram_embedding_mixed_precision", None)
+    if not isinstance(entry, dict):
+        return False
+    return (
+        str(entry.get("format", "")).lower() == "int8"
+        and int(entry.get("weight_bits", 0)) == 8
+    )
 
 
 def _should_prefetch_ple() -> bool:
@@ -317,6 +343,87 @@ class HcuQwen4ExpPLEInt8UVAEmbeddingMethod(HcuQwen4ExpPLEInt8EmbeddingMethod):
         return embeddings.to(output_dtype) * scales.to(output_dtype)
 
 
+class HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod(QuantizeMethodBase):
+    """Keep SlimQuant's unquantized PLE table in pinned host memory."""
+
+    supports_prefetch = True
+    requires_device_loading = False
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                    device="cpu",
+                    pin_memory=_is_pin_memory_available(),
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=extra_weight_attrs["weight_loader"],
+            ),
+        )
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        layer._hcu_uva_weight_view = None
+        logger.info_once(
+            "Qwen4Exp PLE %s UVA offload active: %.3f MiB per TP rank",
+            layer.weight.dtype,
+            layer.weight.numel() * layer.weight.element_size() / (1024**2),
+        )
+
+    @staticmethod
+    def _uva_view(layer: nn.Module) -> torch.Tensor:
+        cached = getattr(layer, "_hcu_uva_weight_view", None)
+        if cached is None:
+            cached = torch.ops._C.get_cuda_view_from_cpu_tensor(layer.weight.data)
+            layer._hcu_uva_weight_view = cached
+        return cached
+
+    def apply(self, layer: nn.Module, x: torch.Tensor, bias=None) -> torch.Tensor:
+        raise NotImplementedError("PLE weights only support embedding lookup")
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input_, self._uva_view(layer))
+
+    def prefetch_output_dtype(self, layer: nn.Module) -> torch.dtype:
+        return layer.params_dtype
+
+    def prepare_prefetch(self, layer: nn.Module) -> None:
+        self._uva_view(layer)
+
+    @staticmethod
+    def is_prefetch_prepared(layer: nn.Module) -> bool:
+        return getattr(layer, "_hcu_uva_weight_view", None) is not None
+
+    def prefetch_lookup_into(
+        self,
+        layer: nn.Module,
+        local_ids: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        output.copy_(self.embedding(layer, local_ids))
+
+    def finalize_prefetched(
+        self, layer: nn.Module, rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if layer.tp_size == 1:
+            return rows
+        return tensor_model_parallel_all_reduce(rows)
+
+
 def _make_storage_class(module: ModuleType, quant_config):
     base = module.PLEVocabParallelEmbedding
     if getattr(base, _CLASS_MARKER, False):
@@ -360,6 +467,43 @@ def _make_storage_class(module: ModuleType, quant_config):
                         )
                     except (AssertionError, AttributeError, RuntimeError):
                         pass
+            elif (
+                effective_quant_config is not None
+                and effective_quant_config.get_name() == "slimquant_w4a8"
+                and kwargs.get("quant_method") is None
+            ):
+                if _slimquant_ngram_is_int8(effective_quant_config):
+                    # The checkpoint keeps the PLE ngram table INT8 with
+                    # per-shard weight_scale; reuse the compressed-tensors
+                    # INT8 storage so both weight and weight_scale shards
+                    # load correctly.
+                    if _should_offload_ple_to_cpu():
+                        if not _is_uva_available():
+                            raise RuntimeError(
+                                "Qwen4Exp PLE INT8 CPU offload requires the HCU UVA "
+                                "operator torch.ops._C.get_cuda_view_from_cpu_tensor, "
+                                "but it is unavailable. Install a compatible "
+                                "vLLM/vllm-plugin-das build or disable PLE CPU offload."
+                            )
+                        kwargs["quant_method"] = HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+                    else:
+                        kwargs["quant_method"] = HcuQwen4ExpPLEInt8EmbeddingMethod()
+                    if kwargs.get("params_dtype") is None:
+                        try:
+                            from vllm.config import get_current_vllm_config
+
+                            kwargs["params_dtype"] = (
+                                get_current_vllm_config().model_config.dtype
+                            )
+                        except (AssertionError, AttributeError, RuntimeError):
+                            pass
+                elif _should_offload_ple_to_cpu():
+                    if not _is_uva_available():
+                        raise RuntimeError(
+                            "Qwen4Exp SlimQuant PLE CPU offload requires the HCU UVA "
+                            "operator torch.ops._C.get_cuda_view_from_cpu_tensor"
+                        )
+                    kwargs["quant_method"] = HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
             super().__init__(*args, **kwargs)
             if _should_prefetch_ple():
                 method = self.quant_method
@@ -373,7 +517,7 @@ def _make_storage_class(module: ModuleType, quant_config):
                     logger.warning_once(
                         "Qwen4Exp PLE prefetch is unavailable for %s; using its "
                         "existing inline behavior. This release supports INT8 "
-                        "UVA only; FP8 prefetch is future work.",
+                        "and SlimQuant unquantized UVA; FP8 prefetch is future work.",
                         type(method).__name__,
                     )
 

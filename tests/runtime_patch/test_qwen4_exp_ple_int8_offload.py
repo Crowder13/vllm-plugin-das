@@ -89,19 +89,207 @@ def _storage_class(quant_config):
     class BaseEmbedding:
         def __init__(self, *args, **kwargs):
             del args
-            self.quant_method = kwargs["quant_method"]
+            self.quant_method = kwargs.get("quant_method")
 
     module = SimpleNamespace(PLEVocabParallelEmbedding=BaseEmbedding)
     return patch._make_storage_class(module, quant_config)
 
 
+def test_slimquant_unquantized_ple_honors_cpu_offload(monkeypatch):
+    # The BF16 PLE table must not consume ~24 GiB per rank on TP4.
+    from vllm.model_executor import parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    monkeypatch.setattr(patch, "_is_pin_memory_available", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    storage = _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+    method = storage.quant_method
+    assert method is not None, "SlimQuant PLE did not select CPU offload"
+    layer = torch.nn.Module()
+    method.create_weights(layer, 3, [4], 3, 4, torch.bfloat16,
+                          weight_loader=lambda *args: None)
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight.dtype == torch.bfloat16
+    assert tuple(layer.weight.shape) == (4, 3)
+    assert not hasattr(layer, "weight_scale")
+    assert method.requires_device_loading is False
+
+
+def test_slimquant_ple_offload_requires_uva(monkeypatch):
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    with pytest.raises(RuntimeError, match="UVA"):
+        _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+
+
+def test_slimquant_ple_offload_disabled_preserves_default(monkeypatch):
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: False)
+    config = SimpleNamespace(get_name=lambda: "slimquant_w4a8")
+    storage = _storage_class(config)(prefix="model.layers.2.ple.ngram_embedding")
+    assert storage.quant_method is None
+
+
+def _slimquant_quant_config(ngram_entry):
+    return SimpleNamespace(
+        get_name=lambda: "slimquant_w4a8",
+        ngram_embedding_mixed_precision=ngram_entry,
+    )
+
+
+def test_slimquant_int8_ngram_ple_selects_int8_uva_method(monkeypatch):
+    # SlimQuant checkpoints may keep the PLE ngram table INT8 with per-shard
+    # weight_scale; the storage class must reuse the INT8 UVA method so both
+    # weight and weight_scale shards load instead of crashing in
+    # AutoWeightsLoader on ``ngram_embedding.shard_N.weight_scale``.
+    from vllm.model_executor import parameter
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    monkeypatch.setattr(patch, "_is_pin_memory_available", lambda: False)
+    config = _slimquant_quant_config({"format": "int8", "weight_bits": 8})
+    storage = _storage_class(config)(
+        prefix="model.layers.2.ple.ngram_embedding"
+    )
+    assert isinstance(
+        storage.quant_method, patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod
+    )
+    layer = torch.nn.Module()
+    storage.quant_method.create_weights(
+        layer, 3, [4], 3, 4, torch.bfloat16, weight_loader=lambda *args: None
+    )
+    assert layer.weight.dtype == torch.int8
+    assert layer.weight_scale.dtype == torch.bfloat16
+    assert layer.weight.device.type == "cpu"
+    assert layer.weight_scale.device.type == "cpu"
+
+
+def test_slimquant_int8_ngram_ple_without_offload_selects_resident_int8(
+    monkeypatch,
+):
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: False)
+    config = _slimquant_quant_config({"format": "int8", "weight_bits": 8})
+    storage = _storage_class(config)(
+        prefix="model.layers.2.ple.ngram_embedding"
+    )
+    assert isinstance(
+        storage.quant_method, patch.HcuQwen4ExpPLEInt8EmbeddingMethod
+    )
+    assert not isinstance(
+        storage.quant_method, patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod
+    )
+
+
+def test_slimquant_bf16_ngram_entry_keeps_unquantized_uva(monkeypatch):
+    # A non-int8 ngram entry (or an absent one) must keep the BF16 UVA path.
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    config = _slimquant_quant_config({"format": "float16", "weight_bits": 16})
+    storage = _storage_class(config)(
+        prefix="model.layers.2.ple.ngram_embedding"
+    )
+    assert isinstance(
+        storage.quant_method, patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod
+    )
+
+
+def test_slimquant_from_config_parses_ngram_entry():
+    from vllm_hcu.model_executor.layers.quantization.slimquant_w4a8 import (
+        SlimQuantW4A8Int8Config,
+    )
+
+    parsed = SlimQuantW4A8Int8Config.from_config(
+        {
+            "ignore": [],
+            "mixed_precision": {
+                "ngram_embedding": {"format": "int8", "weight_bits": 8},
+            },
+        }
+    )
+    assert parsed.ngram_embedding_mixed_precision == {
+        "format": "int8",
+        "weight_bits": 8,
+    }
+
+    plain = SlimQuantW4A8Int8Config.from_config({"ignore": []})
+    assert plain.ngram_embedding_mixed_precision is None
+
+
+def test_slimquant_stale_compression_config_does_not_force_int8(monkeypatch):
+    # vLLM may resolve the effective quant config from a top-level
+    # ``quantization_config`` while a stale ``compression_config`` declaring
+    # INT8 ngram remains on hf_config (and is ignored by get_quant_config).
+    # The detector must follow the effective config object only, otherwise
+    # float ngram weights would be forced into INT8 parameters.
+    monkeypatch.setattr(patch, "_should_offload_ple_to_cpu", lambda: True)
+    monkeypatch.setattr(patch, "_is_uva_available", lambda: True)
+    config = _slimquant_quant_config(None)
+    stale_compression = {
+        "mixed_precision": {
+            "ngram_embedding": {"format": "int8", "weight_bits": 8},
+        }
+    }
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(compression_config=stale_compression)
+        )
+    )
+    with set_current_vllm_config(vllm_config):
+        storage = _storage_class(config)(
+            prefix="model.layers.2.ple.ngram_embedding"
+        )
+    assert isinstance(
+        storage.quant_method, patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod
+    )
+
+
+def test_unquantized_ple_uva_lookup_prefetch_and_reload(monkeypatch):
+    method = patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod()
+    layer = torch.nn.Module()
+    layer.params_dtype = torch.bfloat16
+    layer.tp_size = 1
+    layer.weight = torch.nn.Parameter(
+        torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.bfloat16),
+        requires_grad=False,
+    )
+    monkeypatch.setattr(torch.ops._C, "get_cuda_view_from_cpu_tensor",
+                        lambda x: x, raising=False)
+    ids = torch.tensor([[2, 0]])
+    expected = torch.tensor([[[5, 6], [1, 2]]], dtype=torch.bfloat16)
+    torch.testing.assert_close(method.embedding(layer, ids), expected)
+    output = torch.empty_like(expected)
+    method.prepare_prefetch(layer)
+    assert method.is_prefetch_prepared(layer)
+    method.prefetch_lookup_into(layer, ids, output)
+    torch.testing.assert_close(method.finalize_prefetched(layer, output), expected)
+    monkeypatch.setattr(patch, "tensor_model_parallel_all_reduce", lambda x: x * 2)
+    layer.tp_size = 2
+    torch.testing.assert_close(method.finalize_prefetched(layer, output), expected * 2)
+    layer.weight = torch.nn.Parameter(layer.weight.detach().clone() + 10,
+                                      requires_grad=False)
+    method.process_weights_after_loading(layer)
+    assert not method.is_prefetch_prepared(layer)
+    torch.testing.assert_close(method.embedding(layer, ids), expected + 10)
+
+
+@pytest.mark.parametrize("unquantized", [False, True])
 def test_uva_post_load_keeps_parameter_storage_on_cpu(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, unquantized,
 ):
     from vllm.model_executor.model_loader import utils as loader_utils
 
     layer = torch.nn.Module()
-    layer.quant_method = patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    layer.quant_method = (
+        patch.HcuQwen4ExpPLEUnquantizedUVAEmbeddingMethod() if unquantized
+        else patch.HcuQwen4ExpPLEInt8UVAEmbeddingMethod()
+    )
     layer.register_parameter(
         "weight",
         torch.nn.Parameter(torch.empty((4, 3), dtype=torch.int8), requires_grad=False),

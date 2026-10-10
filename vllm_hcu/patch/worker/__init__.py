@@ -203,6 +203,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt.moe", "patch_utils")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_unquantized_oracle")),
     _CallbackSpec(_adapter("op_opt.moe", "patch_int8_oracle")),
+    _CallbackSpec(_adapter("op_opt.moe", "patch_wna16_oracle")),
     _CallbackSpec(
         _adapter("op_opt.moe", "patch_fp8_oracle"),
         feature="deep_gemm",
@@ -212,18 +213,28 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
+    _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
+    _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_sparse_decode")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_attention")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_bf16_compressor")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_load_weights")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_dspark_target")),
+    _CallbackSpec(
+        _adapter("core_fix", "patch_deepseek_v4_rocm_compressor_fusion")
+    ),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_bf16_cache")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mtp_shared_gate")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_vl_moe")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp")),
+    _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_qsa_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_model_state")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_mtp_pp")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen4_exp_ple_conv")),
@@ -237,6 +248,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
 # Attention's public package callback consumes the class installed by the
 # ``attention.attention`` callback, hence the non-alphabetical first entries.
 _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
+    _CallbackSpec(_adapter("op_opt", "patch_custom_ops")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_layer")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_exports")),
     _CallbackSpec(_adapter("op_opt", "patch_attention_backend")),
@@ -248,6 +260,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_mla_indexer")),
     _CallbackSpec(_adapter("op_opt", "patch_flashmla_sparse")),
     _CallbackSpec(_adapter("op_opt", "patch_qwen4_exp_qsa_flash_attn")),
+    _CallbackSpec(_adapter("op_opt", "patch_qwen3_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_delta_h")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_recompute_w_u")),
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
@@ -269,6 +282,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_scaled_mm_linear_kernel")),
     _CallbackSpec(_adapter("op_opt", "patch_input_quant_fp8")),
     _CallbackSpec(_adapter("op_opt", "patch_w8a8_utils")),
+    _CallbackSpec(_adapter("op_opt", "patch_auto_awq")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_scheme")),
     _CallbackSpec(_adapter("op_opt", "patch_compressed_tensors_w8a8_int8")),

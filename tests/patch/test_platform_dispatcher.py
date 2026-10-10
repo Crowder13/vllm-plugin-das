@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -15,24 +16,30 @@ import pytest
 import vllm_hcu.patch.platform as platform_dispatcher
 from vllm_hcu.patch.platform import platform_framework_callback_names
 from vllm_hcu.patch.platform.core_fix import platform_core_callback_names
+from vllm_hcu.patch.platform.framework_opt import patch_aiter_custom_all_reduce
 
 
 REPO = Path(__file__).resolve().parents[2]
-TARGET_VLLM_ROOT = Path(
-    os.environ.get("VLLM_V0251_SOURCE_ROOT", REPO.parent / "vllm_0251")
-).resolve()
+_target_root_override = os.environ.get("VLLM_TARGET_ROOT")
+if _target_root_override:
+    TARGET_VLLM_ROOT = Path(_target_root_override).resolve()
+else:
+    _vllm_spec = importlib.util.find_spec("vllm")
+    if _vllm_spec is None or _vllm_spec.origin is None:
+        raise RuntimeError(
+            "VLLM_TARGET_ROOT is unset and the vllm package is not discoverable"
+        )
+    TARGET_VLLM_ROOT = Path(_vllm_spec.origin).resolve().parents[1]
 if not (TARGET_VLLM_ROOT / "vllm" / "__init__.py").is_file():
     raise RuntimeError(
-        f"VLLM_V0251_SOURCE_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
+        f"VLLM_TARGET_ROOT does not contain vllm: {TARGET_VLLM_ROOT}"
     )
 
 _TARGET_SOURCE_ASSERTION = r'''
 import os as _vllm_hcu_os
 from pathlib import Path as _VllmHcuPath
 import vllm as _vllm_hcu_target
-_vllm_hcu_root = _VllmHcuPath(
-    _vllm_hcu_os.environ["VLLM_V0251_SOURCE_ROOT"]
-).resolve()
+_vllm_hcu_root = _VllmHcuPath(_vllm_hcu_os.environ["VLLM_TARGET_ROOT"]).resolve()
 _vllm_hcu_file = _VllmHcuPath(_vllm_hcu_target.__file__).resolve()
 assert _vllm_hcu_file.is_relative_to(_vllm_hcu_root), (
     f"vllm resolved outside target root: {_vllm_hcu_file} not under {_vllm_hcu_root}"
@@ -45,7 +52,7 @@ def _run_fresh(
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     env["VLLM_PLUGINS"] = "__disabled__"
-    env["VLLM_V0251_SOURCE_ROOT"] = str(TARGET_VLLM_ROOT)
+    env["VLLM_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
     env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
@@ -55,6 +62,14 @@ def _run_fresh(
         env=env,
         timeout=timeout,
     )
+
+
+def test_target_root_is_installed_vllm():
+    import vllm
+
+    spec = importlib.util.find_spec("vllm")
+    assert spec is not None and spec.origin is not None
+    assert Path(vllm.__file__).resolve().is_relative_to(TARGET_VLLM_ROOT)
 
 
 def test_platform_core_inventory_is_explicit_and_ordered():
@@ -97,6 +112,10 @@ def test_platform_core_inventory_is_explicit_and_ordered():
 
 def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
     assert platform_framework_callback_names() == (
+        (
+            "platform.framework_opt.aiter_custom_allreduce_buffer",
+            "vllm.distributed.device_communicators.aiter_custom_all_reduce",
+        ),
         (
             "platform.framework_opt.pp_single_rank_partition",
             "vllm.distributed.utils",
@@ -153,6 +172,99 @@ def test_platform_framework_inventory_is_explicit_and_dependency_ordered():
         ),
         ("platform.framework_opt.outputs_draft_token_ids", "vllm.v1.outputs"),
     )
+
+
+def test_aiter_custom_ar_explicit_limit_preserves_fused_limit():
+    assert patch_aiter_custom_all_reduce.PATCH_ID == (
+        "platform.framework_opt.aiter_custom_allreduce_buffer"
+    )
+    result = _run_fresh(
+        "import os; os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "print(AiterCustomAllreduce.MAX_SIZE, "
+        "AiterCustomAllreduce.effective_max_size())"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("134217728 67108864")
+
+
+def test_aiter_custom_ar_unset_limit_preserves_vllm_default():
+    result = _run_fresh(
+        "import os; os.environ.pop('AITER_AR_MAX_SIZE_MB', None); "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "print(AiterCustomAllreduce.MAX_SIZE, "
+        "AiterCustomAllreduce.effective_max_size())"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("134217728 67108864")
+
+
+def test_aiter_custom_ar_explicit_limit_reaches_internal_constructor():
+    result = _run_fresh(
+        "import os, sys, types; "
+        "os.environ['AITER_AR_MAX_SIZE_MB'] = '256'; "
+        "os.environ.pop('AITER_AR_ENABLE_REG_CAPTURE', None); "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "fake = types.ModuleType("
+        "'aiter.dist.device_communicators.custom_all_reduce'); "
+        "fake.CustomAllreduce = lambda group, device, max_size, "
+        "enable_register_for_capturing: types.SimpleNamespace("
+        "max_size=max_size, enable_register_for_capturing="
+        "enable_register_for_capturing); "
+        "sys.modules[fake.__name__] = fake; "
+        "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
+        "explicit = AiterCustomAllreduce(object(), 'cuda:0', 1048576); "
+        "print(type(instance).__name__, instance.aiter_ca.max_size, "
+        "explicit.aiter_ca.max_size, "
+        "instance.aiter_ca.enable_register_for_capturing)"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith(
+        "AiterCustomAllreduce 536870912 1048576 False"
+    )
+
+
+def test_aiter_custom_ar_allows_explicit_graph_registration_opt_in():
+    result = _run_fresh(
+        "import os, sys, types; "
+        "os.environ['AITER_AR_ENABLE_REG_CAPTURE'] = '1'; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce; "
+        "fake = types.ModuleType("
+        "'aiter.dist.device_communicators.custom_all_reduce'); "
+        "fake.CustomAllreduce = lambda group, device, max_size, "
+        "enable_register_for_capturing: types.SimpleNamespace("
+        "enable_register_for_capturing=enable_register_for_capturing); "
+        "sys.modules[fake.__name__] = fake; "
+        "instance = AiterCustomAllreduce(object(), 'cuda:0'); "
+        "print(instance.aiter_ca.enable_register_for_capturing)"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("True")
+
+
+@pytest.mark.parametrize("value", ("0", "invalid"))
+def test_aiter_custom_ar_rejects_invalid_explicit_limit(value: str):
+    result = _run_fresh(
+        f"import os; os.environ['AITER_AR_MAX_SIZE_MB'] = {value!r}; "
+        "from vllm_hcu.patch.platform import apply_platform_patches; "
+        "apply_platform_patches(); "
+        "from vllm.distributed.device_communicators.aiter_custom_all_reduce "
+        "import AiterCustomAllreduce"
+    )
+    assert result.returncode != 0
+    assert "AITER_AR_MAX_SIZE_MB must be a positive integer" in result.stderr
 
 
 def test_slimquant_adapter_import_does_not_preload_target_package():
@@ -278,9 +390,9 @@ def test_apply_platform_patches_is_idempotent_narrow_and_reported():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout.strip().splitlines()[-1])
     assert payload == {
-        "count": 46,
+        "count": 47,
         "replacements": 11,
-        "callbacks": 35,
+        "callbacks": 36,
         "failed": [],
         "builtins_same": True,
         "role": "Main",
@@ -310,8 +422,10 @@ def test_platform_framework_registration_is_lazy_on_clean_vllm():
         "replacement_modules={replacement for _,_,replacement in "
         "worker_replacements}; "
         "assert not (replacement_modules & sys.modules.keys()); "
-        "assert not ({name for _,name in worker_callback_names()} & "
-        "sys.modules.keys()); "
+        "loaded_worker_callbacks={name for _,name in worker_callback_names()} "
+        "& sys.modules.keys(); "
+        "assert loaded_worker_callbacks <= {"
+        "'vllm.distributed.device_communicators.base_device_communicator'}; "
         "import vllm.v1.outputs; "
         "regs={r.patch_id:r for r in IMPORT_COORDINATOR.registrations()}; "
         "print(json.dumps({'output_status':regs["

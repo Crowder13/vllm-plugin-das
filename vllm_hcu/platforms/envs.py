@@ -28,19 +28,25 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_CUSTOM_RMS_NORM : bool = False
     VLLM_HCU_USE_CUSTOM_AITER_FLA : bool = False
     VLLM_HCU_PP_LAYER_PARTITION_D : Optional[str] = None
-    VLLM_HCU_USE_FUSE_MOE_GATE : bool = False
+    VLLM_HCU_USE_FUSE_MOE_GATE : bool = True
     VLLM_HCU_USE_LIGHTOP_SQRTSOFTPLUS_GATE: bool = True
     VLLM_HCU_USE_LIGHTOP_QWEN_RMSNORM_GATED: bool = True
     VLLM_HCU_USE_LIGHTOP_W16A16_MOE: bool = False
+    VLLM_HCU_USE_LIGHTOP_AWQ: bool = False
+    VLLM_HCU_INDEXER_KCACHE_LAYOUT: str = "preshuffle"
     VLLM_HCU_USE_LIGHTOP_MLA_DECODE_CAT: bool = True
     VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D : bool = False
     VLLM_HCU_USE_DP_CONNECTOR : bool = False
     VLLM_HCU_LIGHTLY_CP_THRESHOLD: int = 2048
     VLLM_HCU_USE_LIGHTOP_TOPK: bool = False
     VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK: bool = True
+    VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM: bool = True
     VLLM_HCU_USE_AITER_MHC: bool = True
     VLLM_HCU_USE_TILELANG_MHC_PRENORM: bool = True
     VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK: bool = False
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL: bool = True
+    VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND: str = "flashmla"
     VLLM_HCU_DEEPSEEK_V4_ROCM_FAST_WOA: bool = True
     VLLM_HCU_ENABLE_DEEPSEEK_V4_MULTI_STREAM: bool = True
     VLLM_HCU_DEEPSEEK_V4_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 16384
@@ -57,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_HCU_USE_FUSE_SILU_AND_MUL: bool = False
     VLLM_HCU_USE_FUSED_SILU_MUL_QUANT: bool = False
     VLLM_HCU_USE_FUSED_QKV_SPLIT_RMS_ROPE_KVSTORE: bool = False
+    VLLM_HCU_USE_FUSED_RMS_ROPE: bool = True
     VLLM_HCU_FLASH_ATTN_BLOCK_ALIGNMENT_SIZE: Optional[int] = None
     VLLM_HCU_MAMBA_SSM_CACHE_DTYPE: bool = False
     VLLM_HCU_USE_AITER_W4A16_MOE: bool = False
@@ -96,10 +103,74 @@ def custom_ops_enabled() -> bool:
     return _environment_flag(os.environ.get("VLLM_HCU_USE_CUSTOM_OPS", "True"))
 
 
+def optional_custom_op_enabled(feature_enabled: bool = True) -> bool:
+    """Resolve an optional optimized operator under the process master.
+
+    Read the master directly from ``os.environ`` so a materialized lazy module
+    attribute cannot freeze the effective policy for later consumers.
+    """
+
+    return custom_ops_enabled() and bool(feature_enabled)
+
+
+def custom_quantization_gemm_enabled() -> bool:
+    """Resolve the quantized-GEMM child switch under the process master."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True")
+        )
+    )
+
+
+def lightop_awq_enabled() -> bool:
+    """Resolve the opt-in LightOp AutoAWQ backend under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False"))
+    )
+
+
+INDEXER_KCACHE_LAYOUT_ENV = "VLLM_HCU_INDEXER_KCACHE_LAYOUT"
+INDEXER_KCACHE_LAYOUTS = ("preshuffle", "normal")
+
+
+def indexer_kcache_layout() -> str:
+    """Resolve the gfx938 GLM5Next sparse-indexer K-cache page layout.
+
+    ``preshuffle`` keeps the official 16x16 tiled KPool pages, decoded by the
+    HCU Triton direct reader. ``normal`` writes token-major pages and decodes
+    them with LightOp ``paged_mqa_logits``. The layout is part of the KV-cache
+    contents, so every rank and every disaggregated prefill/decode peer must
+    use the same value. Disabling the HCU custom-op master switch always keeps
+    the official ``preshuffle`` layout.
+    """
+
+    raw = os.environ.get(INDEXER_KCACHE_LAYOUT_ENV, "preshuffle").strip().lower()
+    if raw not in INDEXER_KCACHE_LAYOUTS:
+        raise ValueError(
+            f"{INDEXER_KCACHE_LAYOUT_ENV} must be one of "
+            f"{INDEXER_KCACHE_LAYOUTS}, got {raw!r}"
+        )
+    if not custom_ops_enabled():
+        return "preshuffle"
+    return raw
+
+
 def ple_prefetch_enabled() -> bool:
     """Resolve PLE stream prefetch under the custom-op master switch."""
     return custom_ops_enabled() and _environment_flag(
         os.environ.get("VLLM_HCU_PLE_PREFETCH_STREAM", "False")
+    )
+
+
+def fused_qwen3_rms_rope_enabled() -> bool:
+    """Resolve Qwen3 fused Q/K RMSNorm plus RoPE under the master switch."""
+
+    return optional_custom_op_enabled(
+        _environment_flag(
+            os.environ.get("VLLM_HCU_USE_FUSED_RMS_ROPE", "True")
+        )
     )
 
 
@@ -171,6 +242,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_NN":
     lambda: (os.environ.get("VLLM_USE_NN", "True").lower() in 
              ("true", "1")),
+    "VLLM_HCU_USE_FUSED_RMS_ROPE":
+    lambda: _environment_flag(
+        os.environ.get("VLLM_HCU_USE_FUSED_RMS_ROPE", "True")
+    ),
     # vLLM will use FlashAttention Backend on hcu, office attention layerout blocksize 128
     "VLLM_HCU_USE_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_HCU_USE_FLASH_ATTN", "False").lower() in
@@ -204,16 +279,19 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_FP8_MIXED_BATCH":
         lambda: (os.getenv('VLLM_HCU_USE_FP8_MIXED_BATCH', 'True').lower() in
                  ("true", "1")),  
-    # If set, control hcu custom gemm including w8a8 int8/fp8 etc
+    # Control HCU custom GEMM for W8A8 INT8/FP8. This feature switch is also
+    # gated by VLLM_HCU_USE_CUSTOM_OPS; disabling the master switch routes
+    # quantized linear GEMM through the target vLLM Triton implementations.
     "VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM", "True").lower() in
              ("true", "1")),
     # If set, control hcu custom unfused or fused kernel ops
     "VLLM_HCU_USE_CUSTOM_OPS":
     custom_ops_enabled,
-    # Select the QSA implementation independently of the generic
-    # FLASH_ATTN backend mode. The QSA dispatcher validates the enum and
-    # applies VLLM_HCU_USE_CUSTOM_OPS as its master gate.
+    # Select the BF16 QSA implementation independently of the generic
+    # FLASH_ATTN backend mode. The BF16 dispatcher applies
+    # VLLM_HCU_USE_CUSTOM_OPS as its master gate; FP8 QSA is selected by the
+    # cache dtype and uses its dedicated reader/writer independently.
     "VLLM_HCU_QSA_BACKEND":
     lambda: os.environ.get("VLLM_HCU_QSA_BACKEND", "cutlass").strip().lower(),
     # If set, control hcu custom silu and mul op
@@ -271,6 +349,10 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D":
     lambda: (os.environ.get("VLLM_HCU_USE_CUSTOM_CAUSAL_CONV1D", "True").lower() in
              ("true", "1")),
+    "VLLM_HCU_USE_LIGHTOP_AWQ":
+    lambda: _environment_flag(
+        os.environ.get("VLLM_HCU_USE_LIGHTOP_AWQ", "False")
+    ),
     # vllm use dp connector
     "VLLM_HCU_USE_DP_CONNECTOR":
     lambda: (os.environ.get("VLLM_HCU_USE_DP_CONNECTOR", "False").lower() in
@@ -290,6 +372,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
         lambda: (os.environ.get("VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", "True").lower() in
                     ("true", "1")),
 
+    # Use fused TopK + page-table transform for sparse MLA DCP candidates.
+    "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM":
+        lambda: (os.environ.get(
+            "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM", "True"
+        ).lower() in ("true", "1")),
+
     # If use AITER MHC impl, please set True
     "VLLM_HCU_USE_AITER_MHC":
         lambda: (os.environ.get("VLLM_HCU_USE_AITER_MHC", "True").lower() in
@@ -299,6 +387,21 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_HCU_USE_TILELANG_MHC_PRENORM":
         lambda: (os.environ.get("VLLM_HCU_USE_TILELANG_MHC_PRENORM", "True").lower() in
                     ("true", "1")),
+
+    # FlashMLA sparse attention for native ROCm DeepSeek-V4.
+    # Both adapter paths also require VLLM_HCU_USE_CUSTOM_OPS; disabling
+    # the master retains the original ROCm/AITER attention and metadata builders.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE":
+        lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_DECODE", "True").lower()
+        in ("true", "1"),
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL":
+        lambda: os.environ.get("VLLM_HCU_DEEPSEEK_V4_ROCM_FLASHMLA_PREFILL", "True").lower()
+        in ("true", "1"),
+    # Provider selection applies only to this adapter's prefill path.
+    "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND":
+        lambda: os.environ.get(
+            "VLLM_HCU_DEEPSEEK_V4_ROCM_SPARSE_PREFILL_BACKEND", "flashmla"
+        ).strip().lower(),
 
     # Whether to route DeepSeek V4 ROCm decode through the legacy fallback.
     "VLLM_HCU_DEEPSEEK_V4_ROCM_DECODE_FALLBACK":
@@ -457,6 +560,12 @@ hcu_vllm_environment_variables: dict[str, Callable[[], Any]] = {
     # not enable FP8 prefetch.
     "VLLM_HCU_PLE_PREFETCH_STREAM":
         ple_prefetch_enabled,
+
+    # gfx938 GLM5Next sparse-indexer K-cache page layout: "preshuffle"
+    # (official 16x16 tiles, HCU Triton decode reader) or "normal"
+    # (token-major pages, LightOp decode reader).
+    "VLLM_HCU_INDEXER_KCACHE_LAYOUT":
+        indexer_kcache_layout,
 }
 
 # end-env-vars-definition

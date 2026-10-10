@@ -55,7 +55,6 @@ if is_flash_attn_varlen_func_available():
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
-    get_current_vllm_config,
     get_current_vllm_config_or_none,
     get_layers_from_vllm_config,
 )
@@ -149,17 +148,23 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        vllm_config = get_current_vllm_config()
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
+        vllm_config = get_current_vllm_config_or_none()
+        model_config = getattr(vllm_config, "model_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
         if (
             model_config
+            and cache_config
             and model_config.is_hybrid
             and (
                 cache_config.mamba_ssm_cache_dtype == "float32"
                 or cache_config.mamba_cache_dtype == "float32"
             )
         ):
+            mode = _get_flash_attn_mode()
+            if mode in ("varlen", "cutlass"):
+                return [64]
+            if mode == "classic":
+                return [128]
             # NOTE(tdoublep): while in principle, FA supports
             # MultipleOf(16), these are the block sizes that do not
             # suffer from the NaN propagation problem described here:
@@ -186,6 +191,10 @@ class HcuFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_sliding_window(cls) -> bool:
         return True
 
     @classmethod
@@ -826,7 +835,13 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
-        self.supports_quant_query_input = flash_attn_supports_quant_query_input()
+        # The upstream query quantizer emits the platform E4M3 dtype. The
+        # vendor E5M2 KV reader requires compute-dtype queries instead of
+        # this mixed FP8 pair; keep native E5M2 K/V storage unchanged.
+        self.supports_quant_query_input = (
+            self.kv_cache_dtype != "fp8_e5m2"
+            and flash_attn_supports_quant_query_input()
+        )
 
         vllm_config = get_current_vllm_config_or_none()
         dcp_a2a = (

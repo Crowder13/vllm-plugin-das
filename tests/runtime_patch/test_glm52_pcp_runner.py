@@ -11,7 +11,7 @@ import inspect
 import sys
 import textwrap
 from dataclasses import dataclass
-from types import FunctionType, ModuleType, SimpleNamespace
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import NamedTuple
 
 import numpy as np
@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from vllm_hcu.patch.worker.framework_opt._common import PatchCompatibilityError
+from vllm_hcu.v1.pcp_manager import HcuPCPManager as RealHcuPCPManager
 
 
 def test_unitary_pcp_world_size_is_fullgraph_compilable() -> None:
@@ -143,6 +144,12 @@ def pcp_runner_module(monkeypatch: pytest.MonkeyPatch):
         def sample_tokens(self, grammar_output):
             events.append("super.sample_tokens")
             assert grammar_output == "grammar"
+            # Upstream 0.28.1 restores PCP only on the final PP stage.
+            # The non-final stage receives the sampled tokens first.
+            if getattr(self, "is_last_pp_rank", True) is False:
+                assert self.execute_model_state.hidden_states is None
+                assert self.execute_model_state.input_batch is self.expected_batch
+                return "received"
             manager = getattr(self, "pcp_manager", None)
             if manager is not None:
                 hidden_states, input_batch = manager.restore_for_sampling(
@@ -441,6 +448,163 @@ def test_pcp_mtp_rebuilds_global_drafter_attention_state(
         "restore_for_sampling",
         "pcp.prepare_global_attn",
         "build_global_slot_mappings_by_layer",
+        "model_state.prepare_global_mtp_attn",
+        "super.sample_tokens",
+    ]
+
+
+def test_pp_nonfinal_restores_batch_without_hidden_collective() -> None:
+    from vllm_hcu.v1.pcp_manager import HcuPCPManager
+
+    manager = object.__new__(HcuPCPManager)
+    global_batch = object()
+    manager._global_batch = global_batch
+    manager.restore_hidden_states = lambda _: pytest.fail(
+        "non-final PP stage attempted hidden-state collective"
+    )
+
+    assert manager.restore_for_sampling(None) == (None, global_batch)
+
+
+def test_pp_final_stage_restores_hidden_once() -> None:
+    from vllm_hcu.v1.pcp_manager import HcuPCPManager
+
+    manager = object.__new__(HcuPCPManager)
+    global_batch = object()
+    local_hidden = object()
+    global_hidden = object()
+    calls = []
+    manager._global_batch = global_batch
+
+    def restore(hidden):
+        calls.append(hidden)
+        return global_hidden
+
+    manager.restore_hidden_states = restore
+
+    assert manager.restore_for_sampling(local_hidden) == (
+        global_hidden,
+        global_batch,
+    )
+    assert calls == [local_hidden]
+
+
+@pytest.mark.parametrize("num_speculative_steps", [0, 2])
+def test_pp_nonfinal_restores_global_batch_before_receive(
+    pcp_runner_module, num_speculative_steps,
+) -> None:
+    """The 0.28.1 upstream non-final PP path does not restore PCP itself."""
+
+    runner_module, events = pcp_runner_module
+    global_batch = object()
+    local_batch = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            events.append("restore_for_sampling")
+            assert hidden_states is None
+            return None, global_batch
+
+    runner = runner_module.HcuGPUModelRunnerV2(
+        _config(4, speculative=bool(num_speculative_steps)), "hcu:0"
+    )
+    runner.is_last_pp_rank = False
+    runner.pcp_manager = Manager()
+    runner.speculator = None
+    runner.num_speculative_steps = num_speculative_steps
+    runner.expected_batch = global_batch
+    runner.execute_model_state = _MTPExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata=None,
+        slot_mappings_by_layer=None,
+        hidden_states=None,
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "received"
+    assert events == ["restore_for_sampling", "super.sample_tokens"]
+
+
+def test_pp_final_mtp_preserves_unequal_draft_counts_and_global_metadata(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_module, events = pcp_runner_module
+    # Unequal per-request draft counts must survive the local-to-global
+    # restoration before the final PP rank rebuilds global drafter metadata.
+    global_batch = SimpleNamespace(
+        req_ids=["prefill", "decode_a", "decode_b"],
+        num_draft_tokens_per_req=np.asarray([0, 1, 2], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 4, 6, 9], dtype=np.int32),
+    )
+    local_batch = SimpleNamespace(
+        # A partitioned prefill can contribute two virtual local rows;
+        # replicated decode rows retain their original draft counts.
+        req_ids=["prefill", "prefill", "decode_a", "decode_b"],
+        num_draft_tokens_per_req=np.asarray([0, 0, 1, 2], dtype=np.int32),
+        query_start_loc_np=np.asarray([0, 1, 2, 4, 7], dtype=np.int32),
+    )
+    global_blocks = np.asarray([[10, 11], [20, 21], [30, 31]])
+    global_slots = np.asarray([640, 641, 642, 643, 1280, 1281, 1920, 1921, 1922])
+    local_hidden = object()
+    global_hidden = object()
+
+    class Manager:
+        def restore_for_sampling(self, hidden_states):
+            events.append("restore_for_sampling")
+            assert hidden_states is local_hidden
+            return global_hidden, global_batch
+
+        def prepare_global_attn(self):
+            events.append("pcp.prepare_global_attn")
+            assert global_batch.num_draft_tokens_per_req.tolist() == [0, 1, 2]
+            return global_blocks, global_slots
+
+    class ModelState:
+        def prepare_attn(self, input_batch, mode, blocks, slots, groups, config):
+            events.append("model_state.prepare_global_mtp_attn")
+            assert input_batch is global_batch
+            assert input_batch.num_draft_tokens_per_req.tolist() == [0, 1, 2]
+            assert input_batch.query_start_loc_np.tolist() == [0, 4, 6, 9]
+            np.testing.assert_array_equal(blocks, global_blocks)
+            np.testing.assert_array_equal(slots, global_slots)
+            return "global-attn"
+
+    monkeypatch.setattr(
+        runner_module,
+        "build_slot_mappings_by_layer",
+        lambda slots, config: "global-slots-by-layer",
+        raising=False,
+    )
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.is_last_pp_rank = True
+    runner.pcp_manager = Manager()
+    runner.speculator = object()
+    runner.model_state = ModelState()
+    runner.kv_cache_config = "kv-config"
+    runner.attn_groups = "attn-groups"
+    runner.expected_batch = global_batch
+    runner.expected_hidden = global_hidden
+    runner.expected_attn_metadata = "global-attn"
+    runner.expected_slot_mappings_by_layer = "global-slots-by-layer"
+    runner.execute_model_state = _MTPExecuteModelState(
+        input_batch=local_batch,
+        attn_metadata="local-attn",
+        slot_mappings_by_layer="local-slots",
+        hidden_states=local_hidden,
+        aux_hidden_states=None,
+        finished_req_ids=set(),
+    )
+    events.clear()
+
+    assert runner.sample_tokens("grammar") == "sampled"
+    assert runner.execute_model_state.input_batch is global_batch
+    assert runner.execute_model_state.hidden_states is global_hidden
+    assert events == [
+        "restore_for_sampling",
+        "pcp.prepare_global_attn",
         "model_state.prepare_global_mtp_attn",
         "super.sample_tokens",
     ]
@@ -1077,3 +1241,253 @@ def test_pcp_default_model_state_rejects_signature_drift() -> None:
     target.DefaultModelState = DefaultModelState
     with pytest.raises(PatchCompatibilityError, match="incompatible signature"):
         adapter.apply_to_module(target)
+
+
+def _install_recording_profile_run(
+    runner_module: ModuleType, seen: list[int]
+) -> None:
+    """Record the token budget observed by the real HCU runner override."""
+
+    def profile_run(self):
+        seen.append(int(self.max_num_tokens))
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+
+
+def test_profile_run_adds_slack_to_pcp_partitioned_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP profiling must include partition and replicated-request headroom."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(16), "hcu:0")
+    runner.max_num_tokens = 16384
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+
+    runner.profile_run()
+
+    assert seen == [1200]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_keeps_global_budget_for_real_mtp_prefill(
+    pcp_runner_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PCP profiling must not shrink the real MTP propose/prefill shape."""
+
+    runner_module, _ = pcp_runner_module
+    speculator_module = importlib.import_module(
+        "vllm.v1.worker.gpu.spec_decode.autoregressive.speculator"
+    )
+    prefill_tokens: list[int] = []
+
+    class ConcreteSpeculator(speculator_module.AutoRegressiveSpeculator):
+        def load_draft_model(self, target_model):
+            raise NotImplementedError
+
+    speculator = object.__new__(ConcreteSpeculator)
+    speculator.num_speculative_steps = 1
+    speculator.max_model_len = 4096
+    speculator.max_num_reqs = 16
+    speculator.hidden_states = torch.zeros((4096, 1))
+    speculator.last_token_indices = torch.zeros(16, dtype=torch.int64)
+    speculator.current_draft_step = torch.tensor(0, dtype=torch.int64)
+    speculator.input_buffers = object()
+    speculator.prefill_cudagraph_manager = None
+    speculator.dp_size = 1
+    speculator.dp_rank = 0
+    speculator.draft_tokens = torch.zeros((16, 1), dtype=torch.int64)
+    speculator._copy_request_inputs = lambda *args, **kwargs: None
+    speculator._prepare_eplb_forward = lambda *args, **kwargs: None
+    speculator.on_prefill_begin = lambda *args, **kwargs: None
+    speculator.on_prefill_end = lambda *args, **kwargs: None
+
+    def record_prefill(self, num_reqs, num_tokens, *args, **kwargs):
+        prefill_tokens.append(int(num_tokens))
+
+    speculator._prefill = MethodType(record_prefill, speculator)
+
+    monkeypatch.setattr(
+        speculator_module,
+        "prepare_prefill_inputs",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        speculator_module,
+        "get_uniform_decode_token_count",
+        lambda *args, **kwargs: None,
+    )
+
+    def dispatch_prefill(
+        manager,
+        num_reqs,
+        num_tokens,
+        uniform_token_count,
+        **kwargs,
+    ):
+        return (
+            SimpleNamespace(
+                cg_mode=speculator_module.CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(
+        speculator_module,
+        "dispatch_cg_and_sync_dp",
+        dispatch_prefill,
+    )
+
+    def profile_run(self):
+        num_tokens = int(self.max_num_tokens)
+        num_reqs = min(num_tokens, int(self.max_num_reqs))
+        input_batch = SimpleNamespace(
+            num_tokens=num_tokens,
+            num_tokens_after_padding=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=np.full(
+                num_reqs,
+                num_tokens // num_reqs,
+                dtype=np.int32,
+            ),
+            seq_lens_cpu_upper_bound=torch.full(
+                (num_reqs,),
+                num_tokens // num_reqs,
+                dtype=torch.int32,
+            ),
+            idx_mapping=torch.arange(num_reqs, dtype=torch.int64),
+            has_prefill=True,
+        )
+        self.speculator.propose(
+            input_batch=input_batch,
+            attn_metadata={},
+            slot_mappings={},
+            last_hidden_states=torch.zeros((num_tokens, 1)),
+            aux_hidden_states=None,
+            num_sampled=torch.ones(num_reqs, dtype=torch.int32),
+            num_rejected=torch.zeros(num_reqs, dtype=torch.int32),
+            last_sampled=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            next_prefill_tokens=torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int64,
+            ),
+            temperature=torch.zeros(self.max_num_reqs),
+            seeds=torch.zeros(self.max_num_reqs, dtype=torch.int64),
+            dummy_run=True,
+            skip_attn_for_dummy_run=True,
+            is_profile=True,
+        )
+
+    runner_module.GPUModelRunner.profile_run = profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+    runner.speculator = speculator
+
+    runner.profile_run()
+
+    assert prefill_tokens == [4096]
+    assert runner.max_num_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    (
+        "budget",
+        "max_num_reqs",
+        "decode_query_len",
+        "lengths",
+        "prefills",
+        "expected",
+    ),
+    [
+        (
+            4096,
+            256,
+            3,
+            [3] * 255 + [3331],
+            [False] * 255 + [True],
+            1599,
+        ),
+        (4096, 512, 3, [3] * 512, [False] * 512, 1536),
+        (512, 256, 1, [1] * 256, [False] * 256, 256),
+    ],
+)
+def test_profile_run_covers_replicated_decode_and_sampler_requests(
+    pcp_runner_module,
+    budget: int,
+    max_num_reqs: int,
+    decode_query_len: int,
+    lengths: list[int],
+    prefills: list[bool],
+    expected: int,
+) -> None:
+    """Profile tokens must cover actual PCP dispatch and sampler concurrency."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(4), "hcu:0")
+    runner.max_num_tokens = budget
+    runner.max_num_reqs = max_num_reqs
+    runner.decode_query_len = decode_query_len
+
+    manager = object.__new__(RealHcuPCPManager)
+    manager._use_mla = True
+    manager.pcp_size = 4
+    actual_dispatch_tokens = manager.get_num_tokens_for_dispatch(
+        np.asarray(lengths, dtype=np.int32),
+        np.asarray(prefills, dtype=np.bool_),
+    )
+
+    runner.profile_run()
+
+    assert actual_dispatch_tokens == expected
+    assert seen[0] >= actual_dispatch_tokens
+    assert min(seen[0], max_num_reqs) == min(budget, max_num_reqs)
+    assert runner.max_num_tokens == budget
+
+
+def test_profile_run_keeps_non_pcp_token_budget(
+    pcp_runner_module,
+) -> None:
+    """PCP=1 must retain the upstream profile token budget."""
+
+    runner_module, _ = pcp_runner_module
+    seen: list[int] = []
+    _install_recording_profile_run(runner_module, seen)
+    runner = runner_module.HcuGPUModelRunnerV2(_config(1), "hcu:0")
+    runner.max_num_tokens = 16384
+
+    runner.profile_run()
+
+    assert seen == [16384]
+    assert runner.max_num_tokens == 16384
+
+
+def test_profile_run_restores_token_budget_after_failure(
+    pcp_runner_module,
+) -> None:
+    """A failed PCP profile must not leak the temporary per-rank budget."""
+
+    runner_module, _ = pcp_runner_module
+
+    def failing_profile_run(self):
+        assert self.max_num_tokens == 624
+        raise RuntimeError("simulated profile failure")
+
+    runner_module.GPUModelRunner.profile_run = failing_profile_run
+    runner = runner_module.HcuGPUModelRunnerV2(_config(8), "hcu:0")
+    runner.max_num_tokens = 4096
+    runner.max_num_reqs = 16
+    runner.decode_query_len = 3
+
+    with pytest.raises(RuntimeError, match="simulated profile failure"):
+        runner.profile_run()
+
+    assert runner.max_num_tokens == 4096

@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -625,6 +626,13 @@ def test_worker_selects_plugin_owned_model_runner(
     expected_class,
 ):
     events: list[tuple[object, object]] = []
+    runner_logs: list[str] = []
+    assert cpu_safe_hcu_worker_module.runner_logger.getEffectiveLevel() <= logging.INFO
+    monkeypatch.setattr(
+        cpu_safe_hcu_worker_module.runner_logger,
+        "info",
+        lambda message, *args: runner_logs.append(message % args),
+    )
     runner_module = ModuleType(expected_module)
 
     class Runner:
@@ -644,6 +652,65 @@ def test_worker_selects_plugin_owned_model_runner(
 
     assert isinstance(result, Runner)
     assert events == [(config, device)]
+    assert runner_logs == ["HCU model runner constructed: Runner"]
+
+
+def test_hcu_worker_rejects_model_runner_v1(cpu_safe_hcu_worker_module):
+    with pytest.raises(RuntimeError, match="only Model Runner V2"):
+        cpu_safe_hcu_worker_module._create_model_runner(
+            object(), object(), use_v2_model_runner=False
+        )
+
+
+@pytest.mark.parametrize(
+    ("enable_dbo", "use_dspark", "expected_ubatches", "expected_lanes"),
+    (
+        (False, False, 1, 1),
+        (True, False, 2, 1),
+        (False, True, 1, 2),
+        (True, True, 2, 2),
+    ),
+)
+def test_hcu_worker_configures_independent_dspark_workspace_lane(
+    monkeypatch,
+    cpu_safe_hcu_worker_module,
+    enable_dbo,
+    use_dspark,
+    expected_ubatches,
+    expected_lanes,
+):
+    calls = []
+    monkeypatch.setattr(
+        cpu_safe_hcu_worker_module,
+        "init_workspace_manager",
+        lambda *args: calls.append(args),
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_dbo=enable_dbo),
+        speculative_config=(
+            SimpleNamespace(use_dspark=lambda: use_dspark)
+            if use_dspark
+            else None
+        ),
+    )
+    device = object()
+
+    cpu_safe_hcu_worker_module._init_hcu_workspace_manager(
+        config,
+        device,
+        use_v2_model_runner=True,
+    )
+
+    assert calls == [(device, expected_ubatches, expected_lanes)]
+
+
+def test_explicit_model_runner_v2_config(monkeypatch):
+    from vllm import envs
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    config = object.__new__(VllmConfig)
+    assert config.use_v2_model_runner is True
 
 
 def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
@@ -686,6 +753,16 @@ def test_hcu_model_runner_v2_scopes_request_phase_around_upstream_execute(
 
     assert get_deepep_auto_request_phase() is None
     assert "execute_model" in adapter.__dict__
+
+
+def test_worker_allocates_separate_dspark_workspace_lane(
+    cpu_safe_hcu_worker_module,
+):
+    spec_config = SimpleNamespace(use_dspark=lambda: True)
+    config = SimpleNamespace(speculative_config=spec_config)
+
+    assert cpu_safe_hcu_worker_module._num_workspace_lanes(config, True) == 2
+    assert cpu_safe_hcu_worker_module._num_workspace_lanes(config, False) == 1
 
 
 def test_worker_does_not_terminal_validate_after_failed_parent_load(
@@ -884,6 +961,7 @@ def test_platform_check_uses_lazy_executor_selector(monkeypatch):
     config = SimpleNamespace(
         model_config=SimpleNamespace(use_mla=False),
         cache_config=None,
+        attention_config=SimpleNamespace(backend=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),
@@ -928,6 +1006,7 @@ def test_hcu_config_preserves_mla_prefix_caching(monkeypatch):
             enable_prefix_caching=True,
             user_specified_block_size=True,
         ),
+        attention_config=SimpleNamespace(backend=None),
         compilation_config=SimpleNamespace(
             cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: False)
         ),

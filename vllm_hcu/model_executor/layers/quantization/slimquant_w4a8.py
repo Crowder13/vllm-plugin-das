@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,9 +11,14 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
+    UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
-from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    LinearMethodBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -21,7 +26,14 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.utils import set_weight_attrs
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
+
 
 class SlimQuantW4A8Int8Config(QuantizationConfig):
     """SlimQuant W4A8 configuration.
@@ -29,6 +41,28 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
     Weights are static, symmetric per-channel INT4 values packed two per byte.
     Activations are dynamically quantized per token to INT8.
     """
+
+    def __init__(
+        self,
+        ignore: list[str] | None = None,
+        w8a8_include: list[str] | None = None,
+        ngram_embedding_mixed_precision: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.ignore = list(ignore or [])
+        self.w8a8_include = (
+            None if w8a8_include is None else list(w8a8_include)
+        )
+        # The PLE ngram table entry parsed from the checkpoint's effective
+        # ``mixed_precision`` map (e.g. ``{"format": "int8",
+        # "weight_bits": 8}``), or None when the checkpoint does not declare
+        # one. Consumers must read it from the resolved config object so the
+        # config-source priority of vLLM's ``get_quant_config`` is inherited.
+        self.ngram_embedding_mixed_precision = (
+            None
+            if ngram_embedding_mixed_precision is None
+            else dict(ngram_embedding_mixed_precision)
+        )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
@@ -48,14 +82,53 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "SlimQuantW4A8Int8Config":
-        return cls()
+        mixed_precision = config.get("mixed_precision")
+        w8a8_include = None
+        ngram_entry = None
+        if isinstance(mixed_precision, dict):
+            if "w8a8_include" in mixed_precision:
+                w8a8_config = mixed_precision.get("w8a8_include") or {}
+                w8a8_include = list(w8a8_config.get("modules") or [])
+            ngram_entry = mixed_precision.get("ngram_embedding")
+            if not isinstance(ngram_entry, dict):
+                ngram_entry = None
+        return cls(
+            ignore=config.get("ignore"),
+            w8a8_include=w8a8_include,
+            ngram_embedding_mixed_precision=ngram_entry,
+        )
+
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper") -> None:
+        self.ignore = hf_to_vllm_mapper.apply_list(self.ignore)
+        if self.w8a8_include is not None:
+            self.w8a8_include = hf_to_vllm_mapper.apply_list(
+                self.w8a8_include
+            )
 
     def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
     ) -> QuantizeMethodBase | None:
+        if self.ignore and should_ignore_layer(
+            prefix,
+            ignore=self.ignore,
+            fused_mapping=self.packed_modules_mapping,
+            use_fnmatch=True,
+        ):
+            if isinstance(layer, RoutedExperts):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
+            if isinstance(layer, LinearBase):
+                return UnquantizedLinearMethod()
+            return None
         if isinstance(layer, LinearBase):
+            if self.w8a8_include is not None and not should_ignore_layer(
+                prefix,
+                ignore=self.w8a8_include,
+                fused_mapping=self.packed_modules_mapping,
+                use_fnmatch=True,
+            ):
+                return UnquantizedLinearMethod()
             layer.scheme = CompressedTensorsW8A8Int8(
                 QuantizationStrategy.CHANNEL, False, True
             )
@@ -102,12 +175,28 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
         """Apply the layer's compressed linear scheme."""
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        supports = getattr(scheme, "supports_quanted_inputs", None)
+        if (
+            x_and_scale_quanted is not None
+            and callable(supports)
+            and bool(supports())
+        ):
+            return scheme.apply_weights(
+                layer,
+                x,
+                bias=bias,
+                x_and_scale_quanted=x_and_scale_quanted,
+            )
         return scheme.apply_weights(layer, x, bias=bias)
+
+    def supports_quanted_inputs(self) -> bool:
+        return True
 
 
 _SLIMQUANT_MOE_LAYOUT_TENSORS = (
@@ -148,22 +237,44 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig:
-        # The checkpoint scales target SlimQuant's high-nibble INT8 domain.
-        # AITER and the vLLM fallback consume signed INT4 values after unpack,
-        # so compensate for the four-bit shift without mutating checkpoint
-        # parameters used as the canonical cache owners.
+        # Keep the checkpoint scale as the canonical value.  The AITER MOE_C
+        # shuffled representation already accounts for the packed INT4
+        # high-nibble convention.  The explicit Triton fallback applies its
+        # separate x16 conversion at the call site instead of changing this
+        # shared configuration.
         self.moe_quant_config = FusedMoEQuantConfig.make(
             torch.int8,
-            w1_scale=layer.w13_weight_scale * 16.0,
-            w2_scale=layer.w2_weight_scale * 16.0,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
             a1_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             per_act_token_quant=True,
             per_out_ch_quant=False,
             block_shape=None,
             weight_dtype="int4",
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
         )
         return self.moe_quant_config
+
+    @staticmethod
+    def _get_deepgemm_moe_quant_config(
+        layer: torch.nn.Module,
+    ) -> FusedMoEQuantConfig:
+        # HIPC consumes the packed high-nibble INT8 domain directly, so its
+        # kernel must receive the checkpoint scales without the INT4-unpack
+        # compensation required by AITER and the vLLM fallback.
+        return FusedMoEQuantConfig.make(
+            torch.int8,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            per_act_token_quant=True,
+            per_out_ch_quant=False,
+            block_shape=None,
+            weight_dtype="int4",
+            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+        )
 
     @property
     def is_monolithic(self) -> bool:
@@ -292,8 +403,9 @@ class SlimQuantW4A8Int8AiterMoEMethod(FusedMoEMethodBase):
                 make_deepep_auto_deepgemm_w4a8_moe_kernel,
             )
 
+            deepgemm_quant_config = self._get_deepgemm_moe_quant_config(layer)
             self.moe_kernel = make_deepep_auto_deepgemm_w4a8_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
+                moe_quant_config=deepgemm_quant_config,
                 moe_config=self.moe,
                 routing_tables=layer._expert_routing_tables(),
             )

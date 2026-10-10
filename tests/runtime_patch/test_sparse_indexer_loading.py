@@ -20,6 +20,39 @@ MODEL_SOURCE = (REPO / "vllm_hcu/models/deepseek_v2.py").read_text(
 )
 
 
+def test_deepseek_v4_indexer_threads_compress_ratio_to_sparse_op():
+    """C4A cache positions must use the same compression as allocation."""
+
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/deepseek_v4_attention.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    indexer_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekV4Indexer"
+    )
+    constructor = next(
+        node
+        for node in indexer_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    sparse_call = next(
+        node
+        for node in ast.walk(constructor)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "SparseAttnIndexer"
+    )
+    keywords = {keyword.arg: keyword.value for keyword in sparse_call.keywords}
+
+    compress_ratio = keywords["compress_ratio"]
+    assert isinstance(compress_ratio, ast.Attribute)
+    assert isinstance(compress_ratio.value, ast.Name)
+    assert compress_ratio.value.id == "self"
+    assert compress_ratio.attr == "compress_ratio"
+
+
 def _load_model_helpers():
     tree = ast.parse(MODEL_SOURCE)
     selected = [
@@ -28,6 +61,9 @@ def _load_model_helpers():
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name
         in {
+            "_compute_skip_topk_layers",
+            "_require_local_indexer_producer",
+            "_resolve_indexer_sharing",
             "_is_local_indexer_weight",
             "_try_load_quantized_indexer_wk",
             "_rewrite_stacked_param_name",
@@ -37,6 +73,9 @@ def _load_model_helpers():
     ast.fix_missing_locations(module)
     namespace = {
         "torch": torch,
+        "extract_layer_index": lambda prefix: int(
+            prefix.split(".layers.")[1].split(".")[0]
+        ),
         "GroupShape": lambda rows, columns: (rows, columns),
         "scaled_dequantize": lambda weight, scale, *, group_shape, out_dtype: (
             weight.to(out_dtype) * 0 + scale.flatten()[0].to(out_dtype)
@@ -44,6 +83,34 @@ def _load_model_helpers():
     }
     exec(compile(module, "deepseek_v2_helpers", "exec"), namespace)
     return namespace
+
+
+def _load_hcu_sparse_indexer_op_contract(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selected = [
+        copy.deepcopy(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name
+        in {"hcu_sparse_attn_indexer", "hcu_sparse_attn_indexer_fake"}
+    ]
+    assert {node.name for node in selected} == {
+        "hcu_sparse_attn_indexer",
+        "hcu_sparse_attn_indexer_fake",
+    }
+    for node in selected:
+        node.decorator_list = []
+    module = ast.Module(body=selected, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "hcu_sparse_indexer_ops", "exec"), namespace)
+    return (
+        namespace["hcu_sparse_attn_indexer"],
+        namespace["hcu_sparse_attn_indexer_fake"],
+    )
 
 
 def _load_v32_sparse_indexer_contract(**dependencies):
@@ -71,6 +138,51 @@ def _load_v32_sparse_indexer_contract(**dependencies):
     return namespace["forward_hip"]
 
 
+def _load_sparse_indexer_forward_hip(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    class_node = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseAttnIndexer"
+    )
+    method = copy.deepcopy(
+        next(
+            node
+            for node in class_node.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward_hip"
+        )
+    )
+    method.decorator_list = []
+    module = ast.Module(body=[method], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_forward_hip", "exec"), namespace)
+    return namespace["forward_hip"]
+
+
+def _load_dcp_topk_merge(**dependencies):
+    source = (
+        REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = copy.deepcopy(
+        next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_merge_dcp_topk_global"
+        )
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = dict(dependencies)
+    exec(compile(module, "sparse_indexer_dcp_merge", "exec"), namespace)
+    return namespace["_merge_dcp_topk_global"]
+
+
 def _load_v32_sparse_indexer_class():
     source = (
         REPO / "vllm_hcu/model_executor/layers/sparse_attn_indexer.py"
@@ -90,6 +202,230 @@ def _load_v32_sparse_indexer_class():
     namespace = {"torch": torch, "SparseAttnIndexer": object}
     exec(compile(module, "v32_sparse_indexer_class", "exec"), namespace)
     return namespace["V32SparseAttnIndexer"]
+
+
+def test_hcu_dcp_topk_merge_selects_global_candidates():
+    """HIP must exchange scored local candidates before sparse attention."""
+
+    local_logits = torch.tensor([[10.0, 1.0, 8.0, -5.0]])
+    local_indices = torch.tensor([[0, 2]], dtype=torch.int32)
+    other_candidates = torch.tensor([[[9.0, 1.0], [7.0, 3.0]]])
+    gathered_inputs: list[tuple[torch.Tensor, int]] = []
+
+    class Group:
+        def all_gather(self, value, dim):
+            gathered_inputs.append((value.clone(), dim))
+            return torch.cat((value, other_candidates), dim=dim)
+
+    merge = _load_dcp_topk_merge(
+        torch=torch,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        get_dcp_group=lambda: Group(),
+        get_lightop_fast_topk_transform=lambda: None,
+        use_lightop_dcp_topk_transform=lambda: False,
+        get_lightop_dcp_topk_metadata=lambda *args: pytest.fail(
+            "disabled LightOp DCP selector was used"
+        ),
+        _assert_cutedsl_dcp_merge_supported=lambda *args: pytest.fail(
+            "HIP DCP merge entered the CUDA/CuteDSL path"
+        ),
+    )
+
+    merge(
+        local_logits,
+        local_indices,
+        topk_tokens=2,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(gathered_inputs) == 1
+    assert gathered_inputs[0][1] == 1
+    torch.testing.assert_close(
+        gathered_inputs[0][0],
+        torch.tensor([[[10.0, 0.0], [8.0, 4.0]]]),
+    )
+    torch.testing.assert_close(
+        local_indices, torch.tensor([[0, 1]], dtype=torch.int32)
+    )
+
+
+def test_hcu_dcp_sparse_indexer_uses_native_path_with_dcp_contract():
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native(*args, **kwargs):
+        calls.append((args, kwargs))
+        return args[12]
+
+    forward_hip = _load_sparse_indexer_forward_hip(
+        torch=SimpleNamespace(Tensor=torch.Tensor),
+        rocm_aiter_ops=SimpleNamespace(is_enabled=lambda: True),
+        _encode_layer_name=lambda value: value,
+        rocm_aiter_sparse_attn_indexer_native=native,
+    )
+    topk_buffer = object()
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        skip_k_cache_insert=False,
+        dcp_rank=1,
+        dcp_world_size=2,
+        cp_kv_cache_interleave_size=1,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=163840,
+        topk_indices_buffer=topk_buffer,
+    )
+
+    assert (
+        forward_hip(indexer, object(), torch.ones(1, 1), None, object())
+        is topk_buffer
+    )
+    assert len(calls) == 1
+    assert calls[0][1] == {
+        "skip_k_cache_insert": False,
+        "dcp_rank": 1,
+        "dcp_world_size": 2,
+        "cp_kv_cache_interleave_size": 1,
+    }
+
+
+def test_hcu_dcp_topk_merge_uses_lightop_fused_global_selection():
+    class Group:
+        def all_gather(self, packed, dim):
+            remote = packed.clone()
+            remote[..., 0].add_(0.5)
+            remote[..., 1].add_(1)
+            return torch.cat((packed, remote), dim=dim)
+
+    fused_calls = []
+    expected = torch.arange(4095, 2047, -1, dtype=torch.int32).reshape(1, -1)
+
+    def fused(**kwargs):
+        fused_calls.append(kwargs)
+        return expected
+
+    merge = _load_dcp_topk_merge(
+        torch=torch,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        get_dcp_group=lambda: Group(),
+        get_lightop_fast_topk_transform=lambda: fused,
+        use_lightop_dcp_topk_transform=lambda: True,
+        get_lightop_dcp_topk_metadata=lambda device, rows, candidates: (
+            torch.full((rows,), candidates, dtype=torch.int32, device=device),
+            torch.arange(rows + 1, dtype=torch.int32, device=device),
+        ),
+    )
+    indices = torch.arange(2048, dtype=torch.int32).reshape(1, -1)
+
+    merge(
+        torch.arange(2048, dtype=torch.float32).reshape(1, -1),
+        indices,
+        topk_tokens=2048,
+        dcp_rank=0,
+        dcp_world_size=2,
+        cp_interleave=1,
+    )
+
+    assert len(fused_calls) == 1
+    call = fused_calls[0]
+    assert call["score"].shape == (1, 4096)
+    assert call["page_table_size_1"].dtype == torch.int32
+    assert torch.equal(call["lengths"], torch.tensor([4096], dtype=torch.int32))
+    assert torch.equal(call["cu_seqlens_q"], torch.tensor([0, 1], dtype=torch.int32))
+    assert torch.equal(indices, expected)
+
+
+def test_hcu_dcp_lightop_topk_requires_custom_ops(monkeypatch):
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    monkeypatch.setattr(decode_topk.henvs, "VLLM_HCU_USE_CUSTOM_OPS", False)
+    monkeypatch.setattr(
+        decode_topk.henvs, "VLLM_HCU_USE_LIGHTOP_SPARSE_MLA_TOPK", True
+    )
+    monkeypatch.setattr(
+        decode_topk.henvs,
+        "VLLM_HCU_USE_LIGHTOP_FAST_TOPK_TRANSFORM",
+        True,
+    )
+
+    assert not decode_topk.use_lightop_dcp_topk_transform()
+
+
+def test_hcu_dcp_topk_metadata_uses_bounded_capacity_buckets():
+    from vllm_hcu.v1.attention.ops import decode_topk
+
+    decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
+    try:
+        for rows in range(1, 130):
+            lengths, cu_seqlens_q = decode_topk.get_lightop_dcp_topk_metadata(
+                torch.device("cpu"), rows, 4096
+            )
+            assert lengths.shape == (rows,)
+            assert cu_seqlens_q.shape == (rows + 1,)
+            assert torch.equal(
+                lengths, torch.full((rows,), 4096, dtype=torch.int32)
+            )
+            assert torch.equal(
+                cu_seqlens_q, torch.arange(rows + 1, dtype=torch.int32)
+            )
+
+        assert len(decode_topk._LIGHTOP_DCP_TOPK_METADATA) == 9
+    finally:
+        decode_topk._LIGHTOP_DCP_TOPK_METADATA.clear()
+
+
+def test_glm53_indexer_types_build_only_full_backbone_and_mtp_indexers():
+    helpers = _load_model_helpers()
+    resolve = helpers["_resolve_indexer_sharing"]
+    config = SimpleNamespace(
+        index_topk=2048,
+        num_hidden_layers=6,
+        indexer_types=["full", "shared", "shared", "full", "shared", "shared"],
+    )
+
+    assert resolve(config, "model.layers.0.self_attn") == (False, False)
+    assert resolve(config, "model.layers.1.self_attn") == (True, False)
+    assert resolve(config, "model.layers.6.self_attn") == (False, True)
+
+
+@pytest.mark.parametrize(
+    ("indexer_types", "match"),
+    [
+        (["full"], "one entry per hidden layer"),
+        (["full", "invalid"], "only supports 'full' and 'shared'"),
+        (["shared", "full"], "preceding 'full' producer"),
+    ],
+)
+def test_glm53_indexer_types_fail_closed(indexer_types, match):
+    helpers = _load_model_helpers()
+    compute = helpers["_compute_skip_topk_layers"]
+    config = SimpleNamespace(
+        index_topk=2048,
+        num_hidden_layers=2,
+        indexer_types=indexer_types,
+    )
+
+    with pytest.raises(ValueError, match=match):
+        compute(config)
+
+
+def test_glm53_pp_stage_requires_a_local_full_indexer_producer():
+    require = _load_model_helpers()["_require_local_indexer_producer"]
+    config = SimpleNamespace(
+        index_topk=2048,
+        num_hidden_layers=6,
+        indexer_types=["full", "shared", "shared", "full", "shared", "shared"],
+    )
+
+    require(config, start_layer=0, end_layer=3)
+    require(config, start_layer=3, end_layer=6)
+    with pytest.raises(RuntimeError, match="starts on shared indexer layer 1"):
+        require(config, start_layer=1, end_layer=3)
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
@@ -227,6 +563,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
             attn_metadata={"indexer": metadata}
         ),
         maybe_gather_indexer_k=gather,
+        _indexer_cache_as_hipc_view=lambda cache: hipc_cache,
         ops=SimpleNamespace(indexer_k_quant_and_cache=cache_insert),
         on_gfx938=lambda: True,
         indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
@@ -235,6 +572,7 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
         _encode_layer_name=lambda value: value,
     )
     cache = object()
+    hipc_cache = object()
     q_quant = torch.tensor([[7.0, 8.0]])
     weights = torch.tensor([[9.0]])
     hidden_states = torch.tensor([[10.0]])
@@ -263,15 +601,16 @@ def test_v32_pcp_gathers_k_and_slots_before_hcu_cache_insertion():
     assert events[0][2] is expanded_slots
     assert events[0][3] is metadata
     assert events[1][1] is gathered_k
-    assert events[1][2] is cache
+    assert events[1][2] is hipc_cache
     assert events[1][3] is gathered_slots
     hcu_args = events[2][1:]
     assert hcu_args[0] is hidden_states
+    assert hcu_args[2] is cache
     assert hcu_args[3] is q_quant
     assert hcu_args[4] is local_k
     assert hcu_args[5] is weights
     assert hcu_args[8] == 2048
-    assert hcu_args[-1] is True
+    assert hcu_args[-4:] == (True, 0, 1, 1)
 
 
 def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
@@ -330,7 +669,7 @@ def test_v32_replicated_mtp_batch_bypasses_static_pcp_indexer_state():
     )
     assert len(calls) == 1
     assert calls[0][4] is local_k
-    assert calls[0][-1] is False
+    assert calls[0][-4:] == (False, 0, 1, 1)
 
 
 def test_v32_decode_only_target_bypasses_pcp_indexer_gather():
@@ -393,7 +732,7 @@ def test_v32_decode_only_target_bypasses_pcp_indexer_gather():
     )
     assert len(calls) == 1
     assert calls[0][4] is local_k
-    assert calls[0][-1] is False
+    assert calls[0][-4:] == (False, 0, 1, 1)
 
 
 def test_v32_hcu_indexer_impl_advertises_pcp_capability():
@@ -549,10 +888,11 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     monkeypatch: pytest.MonkeyPatch,
     kv_cache_shape: tuple[int, ...],
 ) -> None:
-    """Paged LightOp keeps cleanup disabled while skipping metadata precompute."""
+    """Master-off leaves paged MQA unchanged and skips metadata precompute."""
 
     calls: list[tuple[object, ...]] = []
     output = object()
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
 
     def paged_mqa_logits(
         q,
@@ -595,6 +935,7 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     )
     from vllm._aiter_ops import rocm_aiter_ops
 
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: False)
     monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: False)
     monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr(
@@ -625,6 +966,245 @@ def test_rocm_lightop_paged_mqa_keeps_clean_logits_disabled(
     assert calls[0][2].dtype is torch.float32
     assert calls[0][2].is_contiguous()
     assert torch.equal(calls[0][2], weights.float().contiguous())
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64])
+@pytest.mark.parametrize("collapsed_cache", [False, True])
+def test_gfx938_dispatch_reads_original_physical_pages_and_table(
+    monkeypatch: pytest.MonkeyPatch, block_size: int, collapsed_cache: bool
+) -> None:
+    """Decode must pass the original page backing and mapping to the reader."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_linearize_preshuffled_paged_cache",
+        lambda *_args: pytest.fail("decode linearized the full cache"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("decode used LightOp"),
+    )
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    cache = torch.empty((3, block_size, 1, 132), dtype=torch.uint8)
+    supplied_cache = cache[:, :1] if collapsed_cache else cache
+    table = torch.tensor([[2, 0, -1]], dtype=torch.int32)
+    output = torch.ones((1, block_size * 3))
+    calls = []
+
+    def direct_reader(q, physical, weights, lengths, pages, max_len):
+        calls.append((physical, pages, max_len))
+        assert physical.shape == cache.shape
+        assert physical.data_ptr() == cache.data_ptr()
+        assert physical.stride() == cache.stride()
+        assert pages is table
+        return output
+
+    monkeypatch.setattr(
+        runtime, "gfx938_fp8_paged_mqa_logits", direct_reader, raising=False
+    )
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        torch.empty((1, 1, 2, 128), dtype=torch.float8_e4m3fn),
+        supplied_cache,
+        torch.ones((1, 2)),
+        torch.tensor([block_size + 1], dtype=torch.int32),
+        table,
+        torch.empty(0),
+        block_size * 3,
+    )
+    assert actual is output
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("use_aiter", [False, True])
+def test_gfx938_page_one_without_aiter_uses_torch_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    use_aiter: bool,
+) -> None:
+    """True one-token pages need the reference when AITER is unavailable."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr(
+        runtime.current_platform, "fp8_dtype", lambda: torch.float8_e4m3fn
+    )
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: use_aiter)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("LightOp cannot read physical page size one"),
+    )
+    reference = runtime.fp8_paged_mqa_logits_torch
+    calls = []
+
+    def torch_reference(*args):
+        result = reference(*args)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(runtime, "fp8_paged_mqa_logits_torch", torch_reference)
+    keys = torch.zeros((2, 1, 1, 128))
+    keys[:, 0, 0, 0] = torch.tensor([2, 3])
+    cache = torch.cat(
+        (
+            keys.to(torch.float8_e4m3fn).view(torch.uint8),
+            torch.ones((2, 1, 1, 1)).view(torch.uint8),
+        ),
+        dim=-1,
+    )
+    query = torch.zeros((1, 1, 1, 128))
+    query[..., 0] = 2
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        query.to(torch.float8_e4m3fn),
+        cache,
+        torch.ones((1, 1)),
+        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([[0, 1, -1]], dtype=torch.int32),
+        torch.empty(0),
+        4,
+    )
+
+    assert len(calls) == 1
+    assert actual is calls[0]
+    torch.testing.assert_close(
+        actual, torch.tensor([[4.0, 6.0, -float("inf"), -float("inf")]])
+    )
+
+
+def test_gfx938_page_one_forced_aiter_missing_module_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A required backend must fail clearly when its module is missing."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("forced AITER fell through to LightOp"),
+    )
+    with pytest.raises(RuntimeError, match="pa_mqa_logits Triton module"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            torch.empty((2, 1, 1, 132), dtype=torch.uint8),
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64])
+@pytest.mark.parametrize("collapsed_cache", [False, True])
+def test_gfx938_preshuffled_pages_do_not_silently_ignore_force_aiter(
+    monkeypatch: pytest.MonkeyPatch,
+    block_size: int,
+    collapsed_cache: bool,
+) -> None:
+    """Forced AITER cannot consume the gfx938 preshuffled page layout."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(runtime, "paged_mqa_logits_module", lambda: object())
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("forced AITER was silently replaced by LightOp"),
+    )
+    cache = torch.zeros((2, block_size, 1, 132), dtype=torch.uint8)
+    if collapsed_cache:
+        cache = cache[:, :1]
+    with pytest.raises(RuntimeError, match="AITER.*preshuffled"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 1, 128), dtype=torch.float8_e4m3fn),
+            cache,
+            torch.ones((1, 1)),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.empty(0),
+            2,
+            force_aiter_triton=True,
+        )
+
+
+def test_bw1100_paged_mqa_rejects_unsupported_physical_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject pages larger than the LightOp paged-MQA kernel supports."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: SimpleNamespace(paged_mqa_logits=lambda *_args: None),
+    )
+    backing = torch.empty((2, 1152, 1, 132), dtype=torch.uint8)
+    cache = backing[:, :1]
+    with pytest.raises(ValueError, match="Unsupported.*page size"):
+        runtime.rocm_fp8_paged_mqa_logits(
+            torch.empty((1, 1, 32, 128), dtype=torch.float8_e4m3fn),
+            cache,
+            torch.empty((1, 32)),
+            torch.tensor([[1153]], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+            torch.empty(0),
+            1168,
+        )
+
+
+@pytest.mark.parametrize(("is_gfx938", "block_size"), [(False, 16), (True, 1)])
+def test_token_index_paged_mqa_keeps_aiter_stage1_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    is_gfx938: bool,
+    block_size: int,
+) -> None:
+    """Token-index pages must not enter the preshuffled gfx938 route."""
+    runtime = importlib.import_module("vllm_hcu.v1.attention.ops.rocm_aiter_mla_sparse")
+    monkeypatch.setattr(runtime, "_ON_GFX942", False)
+    monkeypatch.setattr(runtime, "on_gfx938", lambda: is_gfx938)
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    monkeypatch.setattr(rocm_aiter_ops, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_get_lightop_attention",
+        lambda: pytest.fail("token-index pages entered the preshuffled path"),
+    )
+
+    def stage1(_q, _cache, _weights, out_qk, _lens, _table, _max_len, *, ChunkQ):
+        out_qk.fill_(0)
+        out_qk[0, 0, 0] = 7
+
+    monkeypatch.setattr(
+        runtime,
+        "paged_mqa_logits_module",
+        lambda: SimpleNamespace(deepgemm_fp8_paged_mqa_logits_stage1=stage1),
+    )
+    original_full = torch.full
+
+    def cpu_full(shape, fill_value, *, device, dtype):
+        return original_full(shape, fill_value, dtype=dtype)
+
+    monkeypatch.setattr(torch, "full", cpu_full)
+    actual = runtime.rocm_fp8_paged_mqa_logits(
+        torch.empty((1, 1, 2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty((1, block_size, 1, 132), dtype=torch.uint8),
+        torch.zeros((1, 2), dtype=torch.float32),
+        torch.tensor([1], dtype=torch.int32),
+        torch.tensor([[0]], dtype=torch.int32),
+        torch.empty(0),
+        16,
+        force_aiter_triton=True,
+    )
+    assert actual[0, 0] == 7
 
 
 def test_sparse_mla_runtime_rejects_legacy_attention_namespaces(
@@ -711,11 +1291,125 @@ def test_v32_pcp_one_preserves_existing_hcu_custom_op_ownership():
     )
     assert len(calls) == 1
     assert calls[0][4] is local_k
-    assert calls[0][-1] is False
+    assert calls[0][-4:] == (False, 0, 1, 1)
+
+
+def test_v32_hcu_custom_op_receives_constructor_dcp_constants():
+    calls: list[tuple[object, ...]] = []
+
+    def hcu_op(*args):
+        calls.append(args)
+
+    forward_hip = _load_v32_sparse_indexer_contract(
+        torch=SimpleNamespace(
+            Tensor=torch.Tensor,
+            ops=SimpleNamespace(
+                vllm=SimpleNamespace(hcu_sparse_attn_indexer=hcu_op)
+            ),
+        ),
+        effective_pcp_world_size=lambda value: value,
+        get_forward_context=lambda: pytest.fail(
+            "DCP constants should not be read from forward context"
+        ),
+        maybe_gather_indexer_k=lambda *args: pytest.fail(
+            "PCP=1 gathered sparse-indexer cache inputs"
+        ),
+        ops=SimpleNamespace(
+            indexer_k_quant_and_cache=lambda *args: pytest.fail(
+                "PCP=1 moved cache ownership outside the custom op"
+            )
+        ),
+        on_gfx938=lambda: True,
+        indexer_k_bf16_cache_triton=lambda *args: pytest.fail(
+            "PCP=1 moved cache ownership outside the custom op"
+        ),
+        _encode_layer_name=lambda value: value,
+    )
+    indexer = SimpleNamespace(
+        use_fp4_cache=False,
+        use_pcp=False,
+        pcp_world_size=1,
+        skip_k_cache_insert=False,
+        dcp_rank=2,
+        dcp_world_size=4,
+        cp_kv_cache_interleave_size=8,
+        k_cache=SimpleNamespace(prefix="indexer", kv_cache=object()),
+        quant_block_size=128,
+        scale_fmt="e8m0",
+        topk_tokens=2048,
+        head_dim=128,
+        max_model_len=65536,
+        max_total_seq_len=65536,
+        topk_indices_buffer=object(),
+    )
+
+    assert (
+        forward_hip(
+            indexer,
+            object(),
+            torch.ones(1, 2),
+            torch.ones(1, 2),
+            object(),
+        )
+        is indexer.topk_indices_buffer
+    )
+    assert calls[0][-4:] == (False, 2, 4, 8)
+
+
+def test_hcu_custom_op_real_and_fake_share_dcp_schema_and_forward_constants():
+    native_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def native(*args, **kwargs):
+        native_calls.append((args, kwargs))
+
+    fake_calls: list[tuple[object, ...]] = []
+
+    def fake(*args):
+        fake_calls.append(args)
+
+    real_op, fake_op = _load_hcu_sparse_indexer_op_contract(
+        torch=torch,
+        LayerNameType=object,
+        rocm_aiter_sparse_attn_indexer_native=native,
+        rocm_aiter_sparse_attn_indexer_fake=fake,
+    )
+    common_args = (
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        128,
+        "e8m0",
+        2048,
+        128,
+        8192,
+        8192,
+        object(),
+    )
+
+    real_op(*common_args, False, 2, 4, 8)
+    assert native_calls[0][0] == common_args
+    assert native_calls[0][1] == {
+        "skip_k_cache_insert": False,
+        "dcp_rank": 2,
+        "dcp_world_size": 4,
+        "cp_kv_cache_interleave_size": 8,
+    }
+
+    fake_op(*common_args, False, 2, 4, 8)
+    assert fake_calls == [common_args]
 
 
 def test_hcu_sparse_indexer_custom_op_has_no_tensor_return() -> None:
-    importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
+    if not hasattr(torch.ops.vllm, "hcu_sparse_attn_indexer"):
+        # With pytest's plugin disabled, an earlier Hy4 import can register
+        # the upstream op under the same name. Torch schemas cannot be
+        # replaced in-process; this HCU-only check runs in isolation instead.
+        if hasattr(torch.ops.vllm, "sparse_attn_indexer"):
+            pytest.skip("upstream sparse indexer already registered")
+        importlib.import_module("vllm_hcu.model_executor.layers.sparse_attn_indexer")
 
     schema = torch.ops.vllm.hcu_sparse_attn_indexer.default._schema
     assert len(schema.returns) == 0
@@ -796,4 +1490,4 @@ def test_sparse_indexer_non_aiter_fallback_stays_opaque(monkeypatch):
     assert result is topk_buffer
     assert len(calls) == 1
     assert calls[0][4] is None
-    assert calls[0][-1] is True
+    assert calls[0][-4:] == (True, 0, 1, 1)

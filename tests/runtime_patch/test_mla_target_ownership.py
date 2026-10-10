@@ -82,6 +82,7 @@ def _install_stub(monkeypatch, name, **values):
 @pytest.fixture
 def cpu_flashmla(monkeypatch):
     class AttentionCGSupport:
+        NEVER = "never"
         UNIFORM_BATCH = "uniform-batch"
 
     class AttentionType:
@@ -89,6 +90,12 @@ def cpu_flashmla(monkeypatch):
 
     class QueryLenSupport:
         UNIFORM = "uniform"
+
+    class MLACommonMetadataBuilder(_GenericStub):
+        @classmethod
+        def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+            del vllm_config, kv_cache_spec
+            return cls._cudagraph_support
 
     _install_stub(monkeypatch, "vllm.envs", VLLM_BATCH_INVARIANT=False)
     _install_stub(monkeypatch, "vllm.config", VllmConfig=type("VllmConfig", (), {}))
@@ -109,7 +116,7 @@ def cpu_flashmla(monkeypatch):
         MLACommonDecodeMetadata=_GenericStub,
         MLACommonImpl=_MLACommonImplStub,
         MLACommonMetadata=_GenericStub,
-        MLACommonMetadataBuilder=_GenericStub,
+        MLACommonMetadataBuilder=MLACommonMetadataBuilder,
         QueryLenSupport=QueryLenSupport,
     )
     _install_stub(
@@ -398,6 +405,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     triton_calls: list[object] = []
     scale_calls: list[object] = []
+    impl_post_load_calls: list[torch.dtype] = []
     upstream = SimpleNamespace(
         get_and_maybe_dequant_weights=lambda layer, out_dtype: physical_weight,
         rocm_aiter_ops=SimpleNamespace(
@@ -411,6 +419,11 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
         ),
     )
     mla = SimpleNamespace(
+        impl=SimpleNamespace(
+            process_weights_after_loading=lambda dtype: (
+                impl_post_load_calls.append(dtype)
+            )
+        ),
         kv_b_proj=object(),
         kv_lora_rank=kv_lora_rank,
         num_heads=num_heads,
@@ -446,6 +459,7 @@ def test_mla_weight_processing_falls_back_to_bf16_bmm_for_both_layouts(
     )
     assert triton_calls == []
     assert scale_calls == [(mla, False)]
+    assert impl_post_load_calls == [torch.bfloat16]
 
 
 def test_mla_feature_off_delegates_exact_v0251_forward_on_rocm():
@@ -853,6 +867,16 @@ def test_dense_and_sparse_mla_metadata_carry_parallel_sizes(monkeypatch):
     )
 
     class FlashMLASparseMetadataBuilder:
+        def __init__(
+            self,
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+        ):
+            del kv_cache_spec, layer_names, device
+            self.vllm_config = vllm_config
+
         def build(
             self,
             common_prefix_len,
@@ -901,12 +925,17 @@ def _build_fp8_separate_prefill_decode(
         sparse_module._build_fp8_separate_prefill_decode
     )
     assert sparse_adapter.apply_to_module(sparse_module) is True
-    sparse_builder = FlashMLASparseMetadataBuilder()
-    sparse_builder.vllm_config = SimpleNamespace(
+    sparse_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
             cp_kv_cache_interleave_size=4,
         )
+    )
+    sparse_builder = FlashMLASparseMetadataBuilder(
+        None,
+        (),
+        sparse_config,
+        torch.device("cpu"),
     )
 
     sparse_metadata = sparse_builder.build(0, common)
@@ -970,6 +999,35 @@ def test_flashmla_impl_owns_quant_query_capability(
     assert impl.supports_quant_query_input is expected
 
 
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected"),
+    [
+        ("auto", "uniform-batch"),
+        ("float16", "uniform-batch"),
+        ("bfloat16", "uniform-batch"),
+        ("fp8", "uniform-batch"),
+        ("fp8_e4m3", "uniform-batch"),
+        ("fp8_e5m2", "uniform-batch"),
+        ("fp8_ds_mla", "uniform-batch"),
+    ],
+)
+def test_flashmla_supported_kv_dtypes_retain_full_graph_support(
+    cpu_flashmla,
+    cache_dtype,
+    expected,
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+    )
+
+    support = cpu_flashmla.FlashMLAMetadataBuilder.get_cudagraph_support(
+        config,
+        SimpleNamespace(),
+    )
+
+    assert support == expected
+
+
 def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
     monkeypatch,
     cpu_flashmla,
@@ -997,6 +1055,9 @@ def test_only_hcu_dense_and_sparse_mla_impls_advertise_pcp(
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadataBuilder=type(
+            "UpstreamSparseMetadataBuilder", (), {}
+        ),
     )
     module_name = "_vllm_hcu_cpu_test_flashmla_sparse_backend"
     source = (
@@ -1025,6 +1086,11 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
     class UpstreamFlashMLASparseImpl:
         supports_pcp = False
         can_return_lse_for_decode = False
+
+        def __init__(self):
+            self.kv_cache_dtype = "auto"
+            self.qk_rope_head_dim = 1
+            self.q_concat_buffer = torch.empty(2, 4, 4)
 
         def forward_mqa(self, q, kv_cache, attn_metadata, layer):
             calls.append(("upstream", q, kv_cache, attn_metadata, layer))
@@ -1106,6 +1172,9 @@ def test_hcu_sparse_mla_dcp_localizes_owned_indices_and_masks_empty_rows(
         "vllm.v1.attention.backends.mla.flashmla_sparse",
         FlashMLASparseBackend=UpstreamFlashMLASparseBackend,
         FlashMLASparseImpl=UpstreamFlashMLASparseImpl,
+        FlashMLASparseMetadataBuilder=type(
+            "UpstreamSparseMetadataBuilder", (), {}
+        ),
     )
     _install_stub(monkeypatch, "vllm._custom_ops", concat_mla_q=concat_mla_q)
     _install_stub(
@@ -1271,3 +1340,172 @@ def test_flashmla_cat_route_consumes_split_query(
     assert calls[0]["q_pe"] is q_pe
     assert calls[0]["block_table"] is block_table
     assert calls[0]["cache_seqlens"] is seq_lens
+
+
+@pytest.mark.parametrize("initial_rows", [40, 160])
+def test_flashmla_fp8_graph_metadata_grows_and_keeps_only_valid_rows(
+    monkeypatch,
+    cpu_flashmla,
+    initial_rows,
+):
+    flashmla = cpu_flashmla
+    valid_tile_metadata = torch.arange(80 * 8, dtype=torch.int32).reshape(80, 8)
+    valid_num_splits = torch.tensor([0, 3], dtype=torch.int32)
+    scheduler_metadata = SimpleNamespace()
+
+    monkeypatch.setattr(
+        flashmla,
+        "get_mla_metadata",
+        lambda *args, **kwargs: (scheduler_metadata, None),
+    )
+    monkeypatch.setattr(
+        flashmla,
+        "get_mla_metadata_dense_fp8",
+        lambda *args, **kwargs: (valid_tile_metadata, valid_num_splits),
+    )
+    monkeypatch.setattr(
+        flashmla,
+        "FlashMLADecodeMetadata",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    builder = object.__new__(flashmla.FlashMLAMetadataBuilder)
+    builder.num_q_heads = 10
+    builder.dcp_world_size = 1
+    builder.is_fp8_kvcache = True
+    # A one-token decode needs 160 rows, while a later multi-token MTP
+    # verification needs only 80. Reusing the larger persistent buffer must
+    # not expose its zero-padded tail to the native kernel.
+    builder.cg_buf_tile_scheduler_metadata = torch.full(
+        (initial_rows, 8),
+        -1,
+        dtype=torch.int32,
+    )
+    builder.cg_buf_num_splits = torch.full((9,), -1, dtype=torch.int32)
+    builder.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
+    )
+
+    result = builder._build_decode(
+        block_table_tensor=torch.zeros(1, 3, dtype=torch.int32),
+        seq_lens_device=torch.tensor([139], dtype=torch.int32),
+        max_seq_len=139,
+        query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+        query_start_loc_device=torch.tensor([0, 2], dtype=torch.int32),
+        num_decode_tokens=2,
+        dcp_tot_seq_lens_device=None,
+    )
+
+    assert result.scheduler_metadata.tile_scheduler_metadata.shape == (80, 8)
+    torch.testing.assert_close(
+        result.scheduler_metadata.tile_scheduler_metadata,
+        valid_tile_metadata,
+    )
+    torch.testing.assert_close(
+        result.scheduler_metadata.num_splits,
+        valid_num_splits,
+    )
+
+
+@pytest.mark.parametrize("local_lse", [0.1, float("-inf")])
+def test_dcp_single_sink_matches_global_softmax(local_lse):
+    local_lse, other_lse, sink = torch.tensor(
+        [local_lse, 0.7, 1.2], dtype=torch.float64
+    )
+    local_value, other_value = torch.tensor([2.0, 4.0], dtype=torch.float64)
+    rank0_lse = torch.logaddexp(local_lse, sink)
+    rank0_output = torch.where(
+        torch.isneginf(local_lse),
+        0.0,
+        torch.exp(local_lse - rank0_lse) * local_value,
+    )
+
+    merged = (
+        torch.exp(rank0_lse) * rank0_output
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(rank0_lse) + torch.exp(other_lse))
+    oracle = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + torch.exp(sink))
+    double_sink = (
+        torch.exp(local_lse) * local_value
+        + torch.exp(other_lse) * other_value
+    ) / (torch.exp(local_lse) + torch.exp(other_lse) + 2 * torch.exp(sink))
+
+    torch.testing.assert_close(merged, oracle)
+    assert not torch.isclose(double_sink, oracle)
+
+
+def test_hyv4_fp8_dcp_keeps_scattered_local_slots_for_hcu_flashmla(monkeypatch):
+    from vllm.v1.attention.backends.mla import flashmla_sparse as upstream
+    from vllm_hcu.models.hy_v4 import hcu_sparse
+    from vllm_hcu.models.hy_v4.hcu_sparse import HYV4FlashMLASparseImpl
+
+    seen = {}
+
+    def localize(req_ids, block_table, indices, **kwargs):
+        seen.update(kwargs)
+        torch.testing.assert_close(
+            req_ids, torch.tensor([0, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            block_table, torch.tensor([[7], [11]], dtype=torch.int32)
+        )
+        assert indices.shape == (2, 4)
+        return torch.tensor(
+            [[112, -1, 113, -1], [-1, -1, -1, -1]],
+            dtype=torch.int32,
+        )
+
+    monkeypatch.setattr(
+        hcu_sparse, "triton_filter_and_convert_dcp_index", localize
+    )
+    impl = object.__new__(HYV4FlashMLASparseImpl)
+    impl.dcp_world_size = 2
+    impl.dcp_rank = 1
+    impl.need_to_return_lse_for_decode = True
+    kernel_args = {}
+
+    def fp8_kernel(**kwargs):
+        kernel_args.update(kwargs)
+        return (
+            torch.ones(1, 2, 16, 512),
+            torch.zeros(1, 16, 2),
+        )
+
+    monkeypatch.setattr(impl, "_fp8_flash_mla_kernel", fp8_kernel)
+    fp8 = upstream.FlashMLASparseMetadata.FP8KernelMetadata(
+        scheduler_metadata=None,
+        cache_lens=torch.tensor([2], dtype=torch.int32),
+        dummy_block_table=torch.zeros(1, 1, dtype=torch.int32),
+    )
+    metadata = SimpleNamespace(
+        req_id_per_token=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[7], [11]], dtype=torch.int32),
+        cp_kv_cache_interleave_size=1,
+        block_size=64,
+        fp8_extra_metadata=fp8,
+    )
+
+    out, lse = impl._forward_fp8_kv_mixed_batch(
+        torch.zeros(2, 16, 576),
+        torch.zeros(4, 656, dtype=torch.uint8),
+        torch.zeros(2, 4, dtype=torch.int32),
+        metadata,
+    )
+
+    assert seen["dcp_size"] == 2 and seen["dcp_rank"] == 1
+    assert seen["compact_valid_to_front"] is False
+    assert seen["cp_kv_cache_interleave_size"] == 1
+    torch.testing.assert_close(
+        kernel_args["topk_indices"],
+        torch.tensor(
+            [[[112, -1, 113, -1], [-1, -1, -1, -1]]],
+            dtype=torch.int32,
+        ),
+    )
+    assert kernel_args["q"].shape == (1, 2, 16, 576)
+    assert "topk_length" not in kernel_args
+    assert torch.count_nonzero(out[1]) == 0
+    assert torch.isneginf(lse[1]).all()

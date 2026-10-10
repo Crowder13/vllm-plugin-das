@@ -50,6 +50,182 @@ def _module(name: str, **values) -> ModuleType:
     return module
 
 
+@pytest.mark.parametrize(
+    "adapter_name",
+    ("patch_fla_chunk_o", "patch_fla_chunk_delta_h"),
+)
+def test_fla_selector_master_off_ignores_materialized_true_attribute(
+    monkeypatch: pytest.MonkeyPatch,
+    adapter_name: str,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter(adapter_name)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_AITER_FLA", True)
+
+    assert adapter._enabled() is False
+
+
+def _import_hcu_sparse_indexer_without_custom_op_registration(
+    monkeypatch, request
+):
+    """Import the implementation after another test registered its torch op."""
+    from vllm.model_executor.custom_op import CustomOp
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(
+        CustomOp,
+        "register",
+        classmethod(
+            lambda cls, name, dynamic_arg_dims=None: lambda op_cls: op_cls
+        ),
+    )
+    monkeypatch.setattr(
+        torch_utils,
+        "direct_register_custom_op",
+        lambda **kwargs: None,
+    )
+    module_name = "vllm_hcu.model_executor.layers.sparse_attn_indexer"
+    was_cached = module_name in sys.modules
+    imported = importlib.import_module(module_name)
+    if not was_cached:
+        request.addfinalizer(lambda: sys.modules.pop(module_name, None))
+    return imported
+
+
+@pytest.mark.parametrize(
+    ("master_enabled", "expected_backend"),
+    [(False, "boltops"), (True, "native")],
+)
+def test_flashmla_sparse_backend_respects_custom_ops_master_switch(
+    monkeypatch,
+    master_enabled,
+    expected_backend,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def native(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+    ):
+        del q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        return "native"
+
+    def boltops(
+        q,
+        kv,
+        indices,
+        softmax_scale,
+        d_v=512,
+        attn_sink=None,
+        topk_length=None,
+        config=None,
+    ):
+        del q, kv, indices, softmax_scale, d_v, attn_sink, topk_length, config
+        return "boltops"
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setattr(
+        flashmla,
+        "_native_flash_mla_sparse_fwd",
+        native,
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        "1" if master_enabled else "0",
+    )
+    # The effective policy must come from the process environment even after
+    # vLLM's lazy env module materialized the opposite value.
+    monkeypatch.setattr(
+        henvs,
+        "VLLM_HCU_USE_CUSTOM_OPS",
+        not master_enabled,
+        raising=False,
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        result = flashmla.flash_mla_sparse_fwd(
+            q=object(),
+            kv=object(),
+            indices=object(),
+            sm_scale=1.0,
+        )
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    assert result == expected_backend
+
+
+def test_flashmla_sparse_boltops_signature_drift_fails_closed(monkeypatch):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.ops import flashmla
+
+    def incompatible_boltops(q, kv, indices, softmax_scale):
+        del q, kv, indices, softmax_scale
+
+    boltops_mla = _module(
+        "boltops.mla",
+        flash_mla_sparse_fwd=incompatible_boltops,
+    )
+    monkeypatch.setitem(sys.modules, "boltops.mla", boltops_mla)
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
+    flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+    try:
+        with pytest.raises(RuntimeError, match="signature drifted"):
+            flashmla._resolve_sparse_mla_fwd()
+    finally:
+        flashmla._resolve_sparse_mla_fwd.cache_clear()
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_ds_mla", "fp8_e4m3"])
+def test_flashmla_sparse_boltops_rejects_fp8_kv_cache(
+    monkeypatch,
+    kv_cache_dtype,
+):
+    from vllm_hcu.platforms import envs as henvs
+    from vllm_hcu.v1.attention.backends.mla.flashmla_sparse import (
+        HcuFlashMLASparseBackend,
+    )
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_CUSTOM_OPS", True, raising=False
+    )
+
+    reason = HcuFlashMLASparseBackend.supports_combination(
+        head_size=512,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        block_size=64,
+        use_mla=True,
+        has_sink=False,
+        use_sparse=True,
+        use_mm_prefix=False,
+        device_capability=SimpleNamespace(major=9),
+    )
+
+    assert reason is not None
+    assert "BoltOPs" in reason
+    assert "BF16/FP16 KV cache" in reason
+
+
 def _gdn_causal_conv1d_fn(
     x,
     weight,
@@ -218,6 +394,9 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     calls: list[tuple[object, ...]] = []
 
     class FlashMLASparseMetadataBuilder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            del self, kv_cache_spec, layer_names, vllm_config, device
+
         def build(
             self,
             common_prefix_len,
@@ -338,11 +517,18 @@ def test_flashmla_sparse_bf16_preserves_v0251_topk_length(monkeypatch):
     assert calls[-1][-1] == 1
 
 
-def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
+@pytest.mark.parametrize("mixed_batch_enabled", [False, True])
+@pytest.mark.parametrize("mixed_batch_required", [False, True])
+def test_flashmla_sparse_reuses_official_phase_metadata(
+    monkeypatch, mixed_batch_enabled, mixed_batch_required
+):
     adapter = _adapter("patch_flashmla_sparse")
     helper_calls = []
 
     class FlashMLASparseMetadataBuilder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            del self, kv_cache_spec, layer_names, vllm_config, device
+
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             del self, common_prefix_len, common_attn_metadata, fast_build
             return SimpleNamespace(
@@ -389,7 +575,10 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     )
     monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
     monkeypatch.setattr(
-        henvs, "VLLM_HCU_USE_FP8_MIXED_BATCH", False, raising=False
+        henvs,
+        "VLLM_HCU_USE_FP8_MIXED_BATCH",
+        mixed_batch_enabled,
+        raising=False,
     )
     module = _module(
         adapter.TARGET_MODULE,
@@ -400,7 +589,8 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     )
 
     assert adapter.apply_to_module(module)
-    builder = FlashMLASparseMetadataBuilder()
+    builder = object.__new__(FlashMLASparseMetadataBuilder)
+    builder._vllm_hcu_fp8_mixed_batch_required = mixed_batch_required
     builder.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=2,
@@ -410,16 +600,160 @@ def test_flashmla_sparse_reuses_official_phase_metadata(monkeypatch):
     common = SimpleNamespace(num_actual_tokens=4)
     metadata = builder.build(0, common)
 
-    assert metadata.fp8_use_mixed_batch is False
-    assert helper_calls == [(builder, common, metadata)]
-    assert metadata.fp8_extra_metadata.num_decodes == 1
-    assert metadata.fp8_extra_metadata.num_prefills == 3
+    expected_mixed_batch = mixed_batch_enabled or mixed_batch_required
+    assert metadata.fp8_use_mixed_batch is expected_mixed_batch
+    if expected_mixed_batch:
+        assert helper_calls == []
+    else:
+        assert helper_calls == [(builder, common, metadata)]
+        assert metadata.fp8_extra_metadata.num_decodes == 1
+        assert metadata.fp8_extra_metadata.num_prefills == 3
+
+
+def test_flashmla_sparse_admits_hy4_dcp_at_mixed_batch_head_boundary(
+    monkeypatch,
+):
+    adapter = _adapter("patch_flashmla_sparse")
+    rejected = (
+        "DCP for FlashMLA sparse is only supported on the mixed-batch fp8 "
+        "path (num_heads < 32)"
+    )
+
+    class FlashMLASparseMetadataBuilder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            del kv_cache_spec, layer_names, device
+            self.vllm_config = vllm_config
+            self.num_heads = 32
+            self.fp8_decode_padded_heads = 64
+            self.fp8_use_mixed_batch = False
+            raise NotImplementedError(rejected)
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            del common_prefix_len, common_attn_metadata, fast_build
+            return SimpleNamespace(
+                fp8_use_mixed_batch=self.fp8_use_mixed_batch,
+                fp8_extra_metadata=SimpleNamespace(),
+                num_decodes=1,
+                num_prefills=0,
+                num_decode_tokens=1,
+            )
+
+    class FlashMLASparseImpl:
+        @staticmethod
+        def _compute_fp8_decode_padded_heads(num_heads):
+            return 64 if num_heads <= 64 else 128
+
+        def _fp8_flash_mla_kernel(
+            self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+        ):
+            return q
+
+        def _bf16_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=None,
+            actual_num_heads=None,
+        ):
+            return q
+
+    import vllm_hcu.v1.attention.ops.flashmla as hcu_flashmla
+    from vllm_hcu.platforms import envs as henvs
+
+    monkeypatch.setattr(hcu_flashmla, "FlashMLASchedMeta", object)
+    monkeypatch.setattr(hcu_flashmla, "flash_mla_sparse_fwd", lambda *a, **k: None)
+    monkeypatch.setattr(
+        hcu_flashmla, "flash_mla_with_kvcache", lambda **kwargs: (kwargs, None)
+    )
+    monkeypatch.setattr(hcu_flashmla, "get_mla_metadata", lambda *a, **k: None)
+    monkeypatch.setattr(
+        henvs, "VLLM_HCU_USE_FP8_MIXED_BATCH", False, raising=False
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        FlashMLASparseMetadataBuilder=FlashMLASparseMetadataBuilder,
+        FlashMLASparseImpl=FlashMLASparseImpl,
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+        torch=torch,
+    )
+    _install_flashmla_sparse_separate_builder(
+        module, FlashMLASparseMetadataBuilder
+    )
+    assert adapter.apply_to_module(module) is True
+
+    parallel = SimpleNamespace(
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        data_parallel_size=4,
+        enable_expert_parallel=True,
+        cp_kv_cache_interleave_size=1,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architectures=["HYV4ForCausalLM"]),
+        parallel_config=parallel,
+        cache_config=SimpleNamespace(cache_dtype="fp8_e4m3"),
+    )
+    builder = FlashMLASparseMetadataBuilder(None, [], config, torch.device("cpu"))
+    assert builder.fp8_use_mixed_batch is True
+    metadata = builder.build(0, SimpleNamespace(num_actual_tokens=1))
+    assert metadata.fp8_use_mixed_batch is True
+
+    parallel.data_parallel_size = 1
+    with pytest.raises(NotImplementedError, match="mixed-batch fp8"):
+        FlashMLASparseMetadataBuilder(None, [], config, torch.device("cpu"))
+
+
+def test_flashmla_sparse_rejects_reordered_builder_init_signature():
+    adapter = _adapter("patch_flashmla_sparse")
+
+    class Builder:
+        def __init__(self, kv_cache_spec, layer_names, device, vllm_config):
+            del self, kv_cache_spec, layer_names, device, vllm_config
+
+        def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+            return SimpleNamespace()
+
+        def _build_fp8_separate_prefill_decode(
+            self, common_attn_metadata, metadata
+        ):
+            return SimpleNamespace()
+
+    class Impl:
+        def _fp8_flash_mla_kernel(
+            self, q, kv_c_and_k_pe_cache, topk_indices, kernel_metadata
+        ):
+            return q
+
+        def _bf16_flash_mla_kernel(
+            self,
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices,
+            topk_length=None,
+            actual_num_heads=None,
+        ):
+            return q
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        FlashMLASparseMetadataBuilder=Builder,
+        FlashMLASparseImpl=Impl,
+    )
+
+    with pytest.raises(adapter.PatchCompatibilityError, match="__init__"):
+        adapter.apply_to_module(module)
 
 
 def test_flashmla_sparse_rejects_old_separate_metadata_signature(monkeypatch):
     adapter = _adapter("patch_flashmla_sparse")
 
     class Builder:
+        def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+            del self, kv_cache_spec, layer_names, vllm_config, device
+
         def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
             return SimpleNamespace()
 
@@ -452,7 +786,7 @@ def test_flashmla_sparse_rejects_old_separate_metadata_signature(monkeypatch):
         adapter.apply_to_module(module)
 
 
-def test_attention_direct_forward_preserves_cpu_values_and_query_device():
+def test_attention_direct_forward_without_legacy_scale_state_preserves_values():
     from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
     from vllm_hcu.model_executor.layers.mla_runtime import torch as runtime_torch
 
@@ -472,7 +806,6 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
         unified_attention_with_output=attention,
     )
     self = SimpleNamespace(
-        calculate_kv_scales=False,
         query_quant=None,
         num_heads=1,
         num_kv_heads=1,
@@ -505,7 +838,7 @@ def test_attention_direct_forward_preserves_cpu_values_and_query_device():
     assert cache_layer_name == "layer"
 
 
-def test_attention_direct_forward_keeps_layer_name_resolution_outside_fullgraph():
+def test_attention_direct_forward_without_legacy_scale_state_compiles_fullgraph():
     from vllm.utils.torch_utils import LayerName
     from vllm_hcu.model_executor.layers import attention_forward_runtime as runtime
 
@@ -523,7 +856,6 @@ def test_attention_direct_forward_keeps_layer_name_resolution_outside_fullgraph(
     class Probe(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.calculate_kv_scales = False
             self.query_quant = None
             self.num_heads = 1
             self.num_kv_heads = 1
@@ -670,7 +1002,7 @@ def _boltops_chunk_h_contract(
     initial_state_indices=None, output_final_state=True,
     inplace_final_state=False, chunk_size=64, save_new_value=True,
     cu_seqlens=None, chunk_indices=None, use_exp2=False,
-    transpose_state_layout=True, kernel_cfg=None,
+    transpose_state_layout=True, null_state_index=-1, kernel_cfg=None,
 ):
     pass
 
@@ -687,6 +1019,51 @@ def _boltops_recompute_contract(
     k, v, beta, g_cumsum, A, cu_seqlens=None, chunk_indices=None,
 ):
     pass
+
+
+def _boltops_sigmoid_contract(
+    A_log, a, b, dt_bias, q, k, v, beta=1.0, threshold=20.0,
+    scale=None, initial_state=None, inplace_final_state=True,
+    cu_seqlens=None, ssm_state_indices=None, num_accepted_tokens=None,
+    use_qk_l2norm_in_kernel=False, is_kda=False, null_state_index=0,
+    kernel_cfg=None,
+):
+    pass
+
+
+def _boltops_recurrent_contract(
+    mixed_qkv, a, b, A_log, dt_bias, scale, initial_state, out,
+    ssm_state_indices, use_qk_l2norm_in_kernel=False, null_state_index=-1,
+    kernel_cfg=None,
+):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("name", "contract"),
+    (
+        ("chunk_gated_delta_rule_fwd_h", _boltops_chunk_h_contract),
+        ("fused_sigmoid_gating_delta_rule_update", _boltops_sigmoid_contract),
+        (
+            "fused_recurrent_gated_delta_rule_packed_decode",
+            _boltops_recurrent_contract,
+        ),
+    ),
+)
+def test_boltops_resolver_accepts_current_null_state_index_abi(
+    monkeypatch, name, contract
+):
+    from vllm_hcu.patch.worker.op_opt._boltops_fla import (
+        make_boltops_gdn_resolver,
+    )
+
+    def kernel(*args, **kwargs):
+        return args, kwargs
+
+    kernel.__signature__ = inspect.signature(contract)
+    _install_fake_module(monkeypatch, "boltops.fla.gdn", **{name: kernel})
+
+    assert make_boltops_gdn_resolver(name)() is kernel
 
 
 def test_fla_chunk_o_feature_off_is_numerically_identical(monkeypatch):
@@ -767,6 +1144,7 @@ def test_fla_chunk_delta_h_uses_boltops(monkeypatch):
     assert kwargs["save_new_value"] is False
     assert kwargs["use_exp2"] is True
     assert kwargs["transpose_state_layout"] is True
+    assert kwargs["null_state_index"] == 0
 
 
 def test_fla_chunk_o_uses_boltops_and_preserves_output_buffer(monkeypatch):
@@ -1541,8 +1919,31 @@ def test_uniform_short_extends_use_prefill_classification():
     ) == "official"
 
 
-def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
+def test_common_attention_metadata_and_e5m2_mla_cache_writer(monkeypatch):
     adapter = _adapter("patch_attention_backend")
+    cache_calls = []
+
+    class MLAAttentionImpl:
+        def do_kv_cache_update(
+            self,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+        ):
+            cache_calls.append(("official", kv_cache_dtype))
+
+    def concat_and_cache_mla(*args):
+        cache_calls.append(args)
+
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(concat_and_cache_mla=concat_and_cache_mla),
+        ),
+    )
+    _install_fake_module(monkeypatch, "vllm_hcu.hcu_ops")
 
     class CommonAttentionMetadata:
         def __init__(self, query_start_loc, query_start_loc_cpu, seq_lens,
@@ -1584,6 +1985,8 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     module = _module(
         adapter.TARGET_MODULE,
         CommonAttentionMetadata=CommonAttentionMetadata,
+        MLAAttentionImpl=MLAAttentionImpl,
+        torch=fake_torch,
     )
     adapter.apply_to_module(module)
     tensor = torch.arange(4)
@@ -1597,8 +2000,195 @@ def test_common_attention_metadata_accepts_hcu_fields_and_unpads():
     assert metadata.unpadded(2, 1).num_kv_actual_tokens == 2
     assert module.CpCommonAttentionMetadata.__module__.startswith("vllm_hcu")
 
+    tensor = torch.arange(8).reshape(4, 1, 2)
+    kv_cache = torch.ones(1)
+    slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
+    impl = MLAAttentionImpl()
+    impl.do_kv_cache_update(
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        "auto",
+        torch.ones(1),
+    )
+    impl.do_kv_cache_update(
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        "fp8_e5m2",
+        torch.ones(1),
+    )
 
-def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
+    assert cache_calls[0] == ("official", "auto")
+    assert cache_calls[1][1].shape == (4, 2)
+    torch.testing.assert_close(cache_calls[1][3], slot_mapping.flatten())
+    assert cache_calls[1][4] == "fp8_e5m2"
+    assert not adapter.apply_to_module(module)
+
+
+def test_e5m2_mla_cache_gather_uses_lightop(monkeypatch):
+    adapter = _adapter("patch_custom_ops")
+    calls = []
+
+    def official_gather(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts=None,
+    ):
+        calls.append(("official", kv_cache_dtype, seq_starts))
+
+    def lightop_gather(*args):
+        calls.append(("lightop", *args))
+
+    _install_fake_module(
+        monkeypatch,
+        "lightop",
+        gather_and_maybe_dequant_cache=lightop_gather,
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        gather_and_maybe_dequant_cache=official_gather,
+    )
+
+    assert adapter.apply_to_module(module)
+    args = tuple(object() for _ in range(5))
+    scale = object()
+    seq_starts = object()
+    module.gather_and_maybe_dequant_cache(
+        *args,
+        4,
+        "auto",
+        scale,
+        seq_starts,
+    )
+    module.gather_and_maybe_dequant_cache(
+        *args,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    assert calls[0] == ("official", "auto", seq_starts)
+    assert calls[1] == (
+        "lightop",
+        *args,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+    assert not adapter.apply_to_module(module)
+
+
+@pytest.mark.parametrize("byte_storage", [False, True])
+def test_e5m2_mla_cache_gather_master_off_uses_torch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    byte_storage: bool,
+):
+    from vllm_hcu.platforms import envs as henvs
+
+    adapter = _adapter("patch_custom_ops")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(henvs, "VLLM_HCU_USE_CUSTOM_OPS", True)
+    _install_fake_module(
+        monkeypatch,
+        "lightop",
+        gather_and_maybe_dequant_cache=lambda *args: pytest.fail(
+            "master-off E5M2 gather must not execute LightOp"
+        ),
+    )
+    logical_cache = (
+        torch.arange(4 * 4 * 3, dtype=torch.float32)
+        .reshape(4, 4, 3)
+        .sub(16)
+        .to(torch.float8_e5m2)
+    )
+    src_cache = (
+        logical_cache.view(torch.uint8) if byte_storage else logical_cache
+    )
+    dst = torch.empty((4, 3), dtype=torch.bfloat16)
+    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    cu_seq_lens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    token_to_seq = torch.tensor([0, 0, 1, 1], dtype=torch.int32)
+    seq_starts = torch.tensor([1, 5], dtype=torch.int32)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def unsupported_upstream(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts=None,
+    ):
+        del (
+            src_cache,
+            dst,
+            block_table,
+            cu_seq_lens,
+            token_to_seq,
+            num_tokens,
+            kv_cache_dtype,
+            scale,
+            seq_starts,
+        )
+        pytest.fail("the upstream HCU op does not implement E5M2")
+
+    module = _module(
+        adapter.TARGET_MODULE,
+        gather_and_maybe_dequant_cache=unsupported_upstream,
+    )
+    adapter.apply_to_module(module)
+
+    result = module.gather_and_maybe_dequant_cache(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        4,
+        "fp8_e5m2",
+        scale,
+        seq_starts,
+    )
+
+    expected = torch.stack(
+        (
+            logical_cache[0, 1],
+            logical_cache[0, 2],
+            logical_cache[3, 1],
+            logical_cache[3, 2],
+        )
+    ).to(torch.bfloat16).mul_(0.5)
+    assert result is None
+    torch.testing.assert_close(dst, expected)
+
+
+@pytest.mark.parametrize(
+    ("requested_dtype", "operator_dtype"),
+    [
+        ("bfloat16", "auto"),
+        ("float16", "auto"),
+        ("fp8_ds_mla", "fp8_ds_mla"),
+    ],
+)
+def test_sparse_mla_cache_update_uses_hcu_operator(
+    monkeypatch,
+    requested_dtype,
+    operator_dtype,
+):
     adapter = _adapter("patch_sparse_mla_attention")
     calls = []
 
@@ -1632,18 +2222,114 @@ def test_sparse_mla_cache_update_uses_hcu_operator(monkeypatch):
     )
 
     assert adapter.apply_to_module(module)
-    tensor = torch.arange(4).reshape(2, 1, 2)
+    tensor = torch.arange(8).reshape(4, 1, 2)
     kv_cache = torch.ones(1)
-    slot_mapping = torch.arange(2).reshape(1, 2)
+    slot_mapping = torch.tensor([[0, -1, 1, -1]], dtype=torch.int32)
     SparseMLACommonImpl().do_kv_cache_update(
-        tensor, tensor, kv_cache, slot_mapping, "fp8", torch.ones(1),
+        tensor,
+        tensor,
+        kv_cache,
+        slot_mapping,
+        requested_dtype,
+        torch.ones(1),
     )
 
     assert len(calls) == 1
-    assert calls[0][1].shape == (2, 2)
-    assert calls[0][3].shape == (2,)
-    assert calls[0][4] == "fp8"
+    assert calls[0][1].shape == (4, 2)
+    torch.testing.assert_close(calls[0][3], slot_mapping.flatten())
+    assert calls[0][4] == operator_dtype
     assert not adapter.apply_to_module(module)
+
+
+@pytest.mark.parametrize("preallocate", [False, True])
+def test_sparse_mla_fp8_nope_cache_update_zero_pads_rope(monkeypatch, preallocate):
+    adapter = _adapter("patch_sparse_mla_attention")
+    observed = {}
+
+    class SparseMLACommonImpl:
+        def do_kv_cache_update(
+            self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale
+        ):
+            raise AssertionError("HCU cache update wrapper was not called")
+
+    def concat_and_cache_mla(*args):
+        observed["pe"] = args[1]
+
+    fake_torch = SimpleNamespace(
+        ops=SimpleNamespace(
+            hcu_ops=SimpleNamespace(concat_and_cache_mla=concat_and_cache_mla),
+        ),
+    )
+    module = _module(
+        adapter.TARGET_MODULE,
+        SparseMLACommonImpl=SparseMLACommonImpl,
+        torch=fake_torch,
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm.platforms",
+        current_platform=SimpleNamespace(is_rocm=lambda: True),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_hcu.v1.attention.backends.fa_utils",
+        hcu_ops=object(),
+    )
+    assert adapter.apply_to_module(module)
+
+    impl = SparseMLACommonImpl()
+    if preallocate:
+        impl._fp8_nope_pe_buffer = torch.zeros((8, 64), dtype=torch.bfloat16)
+    impl.do_kv_cache_update(
+        torch.ones((4, 512), dtype=torch.bfloat16),
+        torch.empty((4, 1, 0), dtype=torch.bfloat16),
+        torch.ones(1),
+        torch.arange(4).view(1, 4),
+        "fp8_ds_mla",
+        torch.ones(1),
+    )
+
+    assert observed["pe"].shape == (4, 64)
+    assert torch.all(observed["pe"] == 0)
+    if preallocate:
+        assert (
+            observed["pe"].untyped_storage().data_ptr()
+            == impl._fp8_nope_pe_buffer.untyped_storage().data_ptr()
+        )
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected_shape"),
+    [
+        ((3, 1, 16, 128), (3, 16, 128)),  # LBHNC
+        ((3, 16, 1, 128), (3, 16, 128)),  # LBNHC
+        ((3, 16, 128), (3, 16, 128)),
+    ],
+)
+def test_indexer_bf16_cache_page_view_accepts_both_vllm_layouts(
+    shape,
+    expected_shape,
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty(shape, dtype=torch.bfloat16)
+
+    page_view = sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
+
+    assert tuple(page_view.shape) == expected_shape
+    assert (
+        page_view.untyped_storage().data_ptr()
+        == cache.untyped_storage().data_ptr()
+    )
+
+
+def test_indexer_bf16_cache_page_view_rejects_multihead_cache():
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    cache = torch.empty((3, 16, 2, 128), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="single-head"):
+        sparse._indexer_bf16_cache_as_page_view(cache, head_dim=128)
 
 
 def test_indexer_wrappers_filter_zero_chunks_and_propagate_kv_count():
@@ -1964,6 +2650,429 @@ def test_sparse_indexer_mixed_padding_keeps_prefill_for_both_topk_paths(
         result,
         torch.tensor([[0], [2], [3], [1]], dtype=torch.int32),
     )
+
+
+def test_sparse_indexer_profile_prefill_with_no_chunks_is_a_noop(monkeypatch):
+    """Graph profiling can advertise prefill while providing no real chunks."""
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 1, 1), dtype=torch.bfloat16),
+        q_fp8=torch.zeros((1, 1, 1), dtype=torch.bfloat16),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=1,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=1,
+        total_seq_lens=0,
+        topk_indices_buffer=torch.full((1, 1), 7, dtype=torch.int32),
+        skip_k_cache_insert=True,
+    )
+
+    assert result.item() == -1
+
+
+def test_hcu_sparse_indexer_prefill_uses_dcp_local_k_layout(
+    monkeypatch, request
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    chunk = SimpleNamespace(
+        total_seq_lens=12,
+        local_total_seq_lens=6,
+        max_local_total_seq_lens=7,
+        skip_kv_gather=False,
+        block_table=torch.zeros((2, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 6, 12], dtype=torch.int32),
+        local_cu_seq_lens=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0, 3], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([3, 6], dtype=torch.int32),
+        token_start=0,
+        token_end=2,
+    )
+    reused_chunk = SimpleNamespace(
+        **{
+            **vars(chunk),
+            "skip_kv_gather": True,
+            "token_start": 2,
+            "token_end": 4,
+        }
+    )
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+                    num_kv_actual_tokens=4,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=4,
+                    prefill=SimpleNamespace(chunks=[chunk, reused_chunk]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    gather_calls: list[tuple[tuple[int, ...], torch.Tensor]] = []
+
+    def gather(cache, k_fp8, k_scale, block_table, cu_seq_lens):
+        del cache, k_scale, block_table
+        gather_calls.append((tuple(k_fp8.shape), cu_seq_lens))
+
+    from vllm import _custom_ops as ops
+
+    monkeypatch.setattr(ops, "cp_gather_indexer_k_quant_cache", gather)
+    gathered_k_ptrs: list[int] = []
+
+    def logits(q, kv, weights, row_starts, row_ends):
+        del q, weights, row_starts, row_ends
+        assert kv[0].shape == (7, 128)
+        gathered_k_ptrs.append(kv[0].data_ptr())
+        return torch.zeros((2, 6), dtype=torch.float32)
+
+    monkeypatch.setattr(sparse, "rocm_fp8_mqa_logits", logits)
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda *args, **kwargs: torch.zeros((2, 1), dtype=torch.int32),
+    )
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(
+        monkeypatch, request
+    )
+    monkeypatch.setattr(indexer, "_merge_dcp_topk_global", lambda *a, **k: None)
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((4, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((4, 32, 128)),
+        k=torch.zeros((4, 128)),
+        weights=torch.ones((4, 32)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=12,
+        topk_indices_buffer=torch.full((4, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+        dcp_rank=0,
+        dcp_world_size=2,
+    )
+
+    assert len(gather_calls) == 1
+    assert gather_calls[0][0] == (7, 128)
+    torch.testing.assert_close(gather_calls[0][1], chunk.local_cu_seq_lens)
+    assert len(gathered_k_ptrs) == 2
+    assert gathered_k_ptrs[0] == gathered_k_ptrs[1]
+
+
+def test_hcu_sparse_indexer_prefill_handles_empty_dcp_shard(
+    monkeypatch, request
+):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    chunk = SimpleNamespace(
+        total_seq_lens=4,
+        local_total_seq_lens=0,
+        max_local_total_seq_lens=4,
+        skip_kv_gather=False,
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        cu_seq_lens=torch.tensor([0, 4], dtype=torch.int32),
+        local_cu_seq_lens=torch.tensor([0, 0], dtype=torch.int32),
+        cu_seqlen_ks=torch.tensor([0], dtype=torch.int32),
+        cu_seqlen_ke=torch.tensor([0], dtype=torch.int32),
+        token_start=0,
+        token_end=1,
+    )
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[chunk]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    from vllm import _custom_ops as ops
+
+    monkeypatch.setattr(
+        ops,
+        "cp_gather_indexer_k_quant_cache",
+        lambda *args, **kwargs: pytest.fail("empty rank gathered KV"),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_mqa_logits",
+        lambda *args, **kwargs: pytest.fail("empty rank computed logits"),
+    )
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    merged: list[tuple[torch.Tensor, torch.Tensor]] = []
+    indexer = _import_hcu_sparse_indexer_without_custom_op_registration(
+        monkeypatch, request
+    )
+    monkeypatch.setattr(
+        indexer,
+        "_merge_dcp_topk_global",
+        lambda logits, indices, *args, **kwargs: merged.append(
+            (logits, indices.clone())
+        ),
+    )
+
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 32, 128)),
+        k=torch.zeros((1, 128)),
+        weights=torch.ones((1, 32)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=4,
+        topk_indices_buffer=torch.full((1, 1), 7, dtype=torch.int32),
+        skip_k_cache_insert=True,
+        dcp_rank=1,
+        dcp_world_size=2,
+    )
+
+    assert len(merged) == 1
+    assert merged[0][0].shape == (1, 0)
+    assert merged[0][1].item() == -1
+    assert result.item() == -1
+
+
+def test_hcu_sparse_indexer_profile_ignores_empty_prefill_chunks(monkeypatch):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: True)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=0,
+                    num_decode_tokens=0,
+                    num_prefills=1,
+                    prefill=SimpleNamespace(chunks=[]),
+                    decode=None,
+                )
+            }
+        ),
+    )
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+    topk = torch.zeros((1, 2), dtype=torch.int32)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 64, 132), dtype=torch.uint8),
+        q_fp8=torch.zeros((1, 1, 128)),
+        k=None,
+        weights=torch.ones((1, 1)),
+        quant_block_size=128,
+        scale_fmt="e4m3",
+        topk_tokens=2,
+        head_dim=128,
+        max_model_len=64,
+        total_seq_lens=1,
+        topk_indices_buffer=topk,
+        skip_k_cache_insert=True,
+    )
+
+    assert result is topk
+    torch.testing.assert_close(topk, torch.full_like(topk, -1))
+
+
+def test_hcu_sparse_indexer_merges_dcp_decode_candidates(monkeypatch, request):
+    from vllm_hcu.v1.attention.ops import rocm_aiter_mla_sparse as sparse
+
+    monkeypatch.setattr(sparse, "DeepseekV32IndexerMetadata", SimpleNamespace)
+
+    class _Platform:
+        @staticmethod
+        def is_rocm():
+            return True
+
+        @staticmethod
+        def fp8_dtype():
+            return torch.float32
+
+    monkeypatch.setattr(sparse, "current_platform", _Platform)
+    monkeypatch.setattr(sparse, "on_gfx938", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={
+                "layer": SimpleNamespace(
+                    slot_mapping=torch.tensor([0], dtype=torch.int32),
+                    num_kv_actual_tokens=1,
+                    num_decodes=1,
+                    num_decode_tokens=1,
+                    num_prefills=0,
+                    prefill=None,
+                    decode=SimpleNamespace(
+                        decode_lens=torch.tensor([1], dtype=torch.int32),
+                        requires_padding=False,
+                        seq_lens=torch.tensor([4], dtype=torch.int32),
+                        global_seq_lens=torch.tensor([8], dtype=torch.int32),
+                        block_table=torch.zeros((1, 1), dtype=torch.int32),
+                        schedule_metadata=torch.zeros(1, dtype=torch.int32),
+                    ),
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr(sparse, "_use_lightop_sparse_mla_topk", lambda: False)
+    monkeypatch.setattr(
+        sparse,
+        "rocm_fp8_paged_mqa_logits",
+        lambda *a, **k: torch.tensor([[0.0, 3.0, 2.0, 1.0]]),
+    )
+    monkeypatch.setattr(
+        sparse,
+        "_topk_indices_torch",
+        lambda *a, **k: torch.tensor([[1]], dtype=torch.int32),
+    )
+    merged = []
+
+    def merge(logits, indices, topk, rank, world, interleave, row_starts=None):
+        merged.append((logits, rank, world, interleave, row_starts))
+        indices.fill_(7)
+
+    indexer_layer = _import_hcu_sparse_indexer_without_custom_op_registration(
+        monkeypatch, request
+    )
+    monkeypatch.setattr(indexer_layer, "_merge_dcp_topk_global", merge)
+    import vllm.utils.torch_utils as torch_utils
+
+    monkeypatch.setattr(torch_utils, "_resolve_layer_name", lambda value: value)
+
+    result = sparse.rocm_aiter_sparse_attn_indexer_native(
+        hidden_states=torch.zeros((1, 1)),
+        k_cache_prefix="layer",
+        kv_cache=torch.zeros((1, 4, 1)),
+        q_fp8=torch.zeros((1, 1, 1)),
+        k=torch.zeros((1, 1)),
+        weights=torch.ones((1, 1)),
+        quant_block_size=1,
+        scale_fmt="e4m3",
+        topk_tokens=1,
+        head_dim=1,
+        max_model_len=8,
+        total_seq_lens=4,
+        topk_indices_buffer=torch.full((1, 1), -1, dtype=torch.int32),
+        skip_k_cache_insert=True,
+        dcp_rank=1,
+        dcp_world_size=2,
+        cp_kv_cache_interleave_size=1,
+    )
+
+    assert len(merged) == 1
+    assert merged[0][1:4] == (1, 2, 1)
+    assert result.item() == 7
 
 
 def test_mla_forward_slices_kv_with_independent_token_count():

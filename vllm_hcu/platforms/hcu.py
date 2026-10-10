@@ -4,6 +4,7 @@ import importlib
 import os
 from datetime import timedelta
 from functools import cache, lru_cache
+from math import lcm
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
 import vllm_hcu.platforms.envs as henvs 
 
 logger = init_logger(__name__)
+
+_HCU_FLASHMLA_BACKEND_PATH = (
+    "vllm_hcu.v1.attention.backends.mla.flashmla.HcuFlashMLABackend"
+)
 
 _ensure_platform_plugin_ready()
 
@@ -150,6 +155,7 @@ def on_gfx938() -> bool:
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
+    prefer_triton_mla: bool = False,
 ) -> list[AttentionBackendEnum]:
     """Get HCU backend priorities; validation filters unavailable kernels."""
     if use_sparse:
@@ -159,6 +165,11 @@ def _get_backend_priorities(
         ]
 
     if use_mla:
+        if prefer_triton_mla:
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.FLASHMLA,
+            ]
         return [
             AttentionBackendEnum.FLASHMLA,
             AttentionBackendEnum.TRITON_MLA,
@@ -203,6 +214,21 @@ def register_attention_backends() -> None:
     for backend, class_path in backends:
         if not backend.is_overridden():
             register_backend(backend, class_path=class_path)
+
+
+def _use_triton_mla_master_fallback(
+    attn_selector_config: "AttentionSelectorConfig",
+) -> bool:
+    """Select Triton for managed dense MLA when custom ops are disabled."""
+
+    return (
+        attn_selector_config.use_mla
+        and not attn_selector_config.use_sparse
+        and not henvs.optional_custom_op_enabled()
+        # A third-party override is not an HCU-managed custom operator.
+        and AttentionBackendEnum.FLASHMLA.get_path()
+        == _HCU_FLASHMLA_BACKEND_PATH
+    )
 
 
 class HCUPlatform(Platform):
@@ -279,9 +305,18 @@ class HCUPlatform(Platform):
         
         register_attention_backends()
         
+        prefer_triton_mla = _use_triton_mla_master_fallback(
+            attn_selector_config
+        )
+        if prefer_triton_mla:
+            logger.warning_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: defaulting managed dense MLA "
+                "to the vLLM Triton MLA backend."
+            )
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
+            prefer_triton_mla,
         )
         for priority, backend in enumerate(backend_priorities):
             try:
@@ -311,6 +346,16 @@ class HCUPlatform(Platform):
 
         attn_selector_config = attn_selector_config._replace(block_size=None)
         register_attention_backends()
+
+        if (
+            selected_backend == AttentionBackendEnum.FLASHMLA
+            and _use_triton_mla_master_fallback(attn_selector_config)
+        ):
+            logger.warning_once(
+                "VLLM_HCU_USE_CUSTOM_OPS=0: replacing the managed HCU "
+                "FLASHMLA backend with vLLM Triton MLA."
+            )
+            selected_backend = AttentionBackendEnum.TRITON_MLA
 
         # First try checking just the selected backend, if there is one.
         if selected_backend is not None:
@@ -571,6 +616,23 @@ class HCUPlatform(Platform):
         cache_config = vllm_config.cache_config
         compilation_config = vllm_config.compilation_config
         parallel_config = vllm_config.parallel_config
+        attention_config = vllm_config.attention_config
+        if (
+            cache_config is not None
+            and getattr(attention_config, "backend", None)
+            == AttentionBackendEnum.FLASHMLA_SPARSE
+            and cache_config.cache_dtype == "fp8_e4m3"
+        ):
+            # The public E4M3 option maps to sparse FlashMLA's packed
+            # DeepSeek-MLA representation (quantized NoPE values, per-group
+            # scales, and BF16 RoPE).  Backend selection validates the
+            # physical format name, so normalize before any attention layer
+            # asks the platform for its backend.
+            cache_config.cache_dtype = "fp8_ds_mla"
+            logger.info_once(
+                "Using fp8_ds_mla as the internal FLASHMLA_SPARSE layout "
+                "for --kv-cache-dtype fp8_e4m3."
+            )
         # if cache_config and cache_config.block_size is None:
         #     cache_config.block_size = 64
         if compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -676,6 +738,35 @@ class HCUPlatform(Platform):
         super().update_block_size_for_backend(vllm_config)
 
         cache_config = getattr(vllm_config, "cache_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        architectures = set(getattr(model_config, "architectures", ()) or ())
+        hf_config = getattr(model_config, "hf_config", None)
+        compress_ratios = getattr(hf_config, "compress_ratios", ()) or ()
+        if "DeepseekV4ForCausalLM" in architectures and cache_config is not None:
+            # DeepSeek-V4's sparse MLA and indexer backends require 256-token
+            # kernel blocks. Its compressed cache additionally requires the
+            # manager block to be divisible by every compression ratio.
+            compressor_alignment = 256
+            for ratio in compress_ratios:
+                ratio = int(ratio)
+                if ratio > 1:
+                    compressor_alignment = lcm(compressor_alignment, ratio)
+            if cache_config.block_size % compressor_alignment:
+                old_block_size = cache_config.block_size
+                cache_config.block_size = (
+                    (old_block_size + compressor_alignment - 1)
+                    // compressor_alignment
+                    * compressor_alignment
+                )
+                logger.warning(
+                    "DeepSeek-V4 sparse backends and compressor ratios require "
+                    "a kv cache block size divisible by %d; overriding %d "
+                    "with %d.",
+                    compressor_alignment,
+                    old_block_size,
+                    cache_config.block_size,
+                )
+
         attention_config = getattr(vllm_config, "attention_config", None)
         backend = getattr(attention_config, "backend", None)
         if (

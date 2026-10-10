@@ -31,6 +31,9 @@ _MARKER = "_vllm_hcu_feature_config_patch_applied"
 _GLM_DSA_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 _HCU_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
+        "HYV4ForCausalLM",
+        "HYV4MTPModel",
+        "DeepseekV4ForCausalLM",
         "Glm5NextForCausalLM",
         "Glm5NextForConditionalGeneration",
         "Glm5NextMTPModel",
@@ -58,6 +61,59 @@ def _normalize_hcu_model_runner(model_config: object) -> None:
         and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
     ):
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+
+
+def _normalize_dspark_draft_deepep_topology(
+    vllm_config: object,
+    feature_config: HcuFeatureConfig,
+) -> HcuFeatureConfig:
+    """Reuse the target's DeepEP topology for DeepSeek-V4 DSpark layers.
+
+    Official DSpark constructs a draft ``VllmConfig`` with
+    ``SpeculativeConfig.draft_parallel_config`` while retaining the target's
+    ``additional_config`` object.  Its generic draft config intentionally drops
+    DP and EP, but the DeepSeek-V4 DSpark head contains three real MoE decoder
+    layers.  Those layers must use the same EP group and DeepEP kernels as the
+    target; otherwise they enter naive dispatch against a DeepEP manager, whose
+    pre-routing interface is intentionally unsupported.
+
+    Object identity distinguishes this internal clone from the target config.
+    Reusing the target config is safe only when both tensor-parallel sizes are
+    equal, which is also the only topology validated here.
+    """
+
+    if not feature_config.deepep_auto or not is_deepseek_v4(vllm_config):
+        return feature_config
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if getattr(speculative_config, "method", None) != "dspark":
+        return feature_config
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    draft_parallel_config = getattr(
+        speculative_config, "draft_parallel_config", None
+    )
+    target_parallel_config = getattr(
+        speculative_config, "target_parallel_config", None
+    )
+    if (
+        parallel_config is not draft_parallel_config
+        or draft_parallel_config is target_parallel_config
+    ):
+        return feature_config
+    if target_parallel_config is None:
+        raise PatchCompatibilityError(
+            "DeepSeek-V4 DSpark deepep_auto requires "
+            "SpeculativeConfig.target_parallel_config"
+        )
+    draft_tp = int(getattr(draft_parallel_config, "tensor_parallel_size", 1))
+    target_tp = int(getattr(target_parallel_config, "tensor_parallel_size", 1))
+    if draft_tp != target_tp:
+        raise ValueError(
+            "DeepSeek-V4 DSpark deepep_auto requires draft and target tensor "
+            f"parallel sizes to match; got draft_tp={draft_tp}, "
+            f"target_tp={target_tp}"
+        )
+    setattr(vllm_config, "parallel_config", target_parallel_config)
+    return feature_config
 
 
 def _normalize_hcu_breakable_cudagraph(vllm_config: object) -> None:
@@ -94,6 +150,102 @@ def _require_hcu_pcp_attribute(owner: object, name: str, owner_name: str) -> Any
         ) from exc
 
 
+def _hy4_pcp_topology(parallel_config: object) -> tuple[int, int, int]:
+    """Identify the validated eight-card Hy4 PCP layouts."""
+    return (
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "tensor_parallel_size", "ParallelConfig"
+            )
+        ),
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "prefill_context_parallel_size", "ParallelConfig"
+            )
+        ),
+        int(
+            _require_hcu_pcp_attribute(
+                parallel_config, "pipeline_parallel_size", "ParallelConfig"
+            )
+        ),
+    )
+
+
+def _require_hy4_pcp8_contract(vllm_config: object) -> None:
+    """Admit only the hardware-gated Hy4 PCP8 MTP3 configuration."""
+
+    speculative_config = _require_hcu_pcp_attribute(
+        vllm_config, "speculative_config", "VllmConfig"
+    )
+    if (
+        speculative_config is None
+        or _require_hcu_pcp_attribute(
+            speculative_config, "method", "SpeculativeConfig"
+        )
+        != "mtp"
+        or int(
+            _require_hcu_pcp_attribute(
+                speculative_config,
+                "num_speculative_tokens",
+                "SpeculativeConfig",
+            )
+        )
+        != 3
+    ):
+        raise ValueError("HY V4 PCP8 requires checkpoint-native MTP3.")
+
+    parallel_config = _require_hcu_pcp_attribute(
+        vllm_config, "parallel_config", "VllmConfig"
+    )
+    kernel_config = _require_hcu_pcp_attribute(
+        vllm_config, "kernel_config", "VllmConfig"
+    )
+    cache_config = _require_hcu_pcp_attribute(
+        vllm_config, "cache_config", "VllmConfig"
+    )
+    if bool(getattr(parallel_config, "enable_eplb", False)):
+        raise ValueError("HY V4 PCP8 does not support EPLB.")
+    if (
+        _require_hcu_pcp_attribute(
+            parallel_config, "all2all_backend", "ParallelConfig"
+        )
+        != "deepep_high_throughput"
+        or _require_hcu_pcp_attribute(
+            kernel_config, "moe_backend", "KernelConfig"
+        )
+        != "deep_gemm"
+        or _require_hcu_pcp_attribute(
+            cache_config, "cache_dtype", "CacheConfig"
+        )
+        not in ("fp8_e4m3", "fp8_ds_mla")
+    ):
+        raise ValueError(
+            "HY V4 PCP8 requires DeepEP HT, DeepGEMM and FP8 E4M3 KV."
+        )
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    attention_config = _require_hcu_pcp_attribute(
+        vllm_config, "attention_config", "VllmConfig"
+    )
+    if (
+        _require_hcu_pcp_attribute(
+            attention_config, "backend", "AttentionConfig"
+        )
+        != AttentionBackendEnum.FLASHMLA_SPARSE
+    ):
+        raise ValueError(
+            "HY V4 PCP8 requires the FLASHMLA_SPARSE attention backend."
+        )
+    if os.environ.get(
+        "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD", "0"
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        raise ValueError(
+            "HY V4 PCP8 requires "
+            "VLLM_HCU_ENABLE_LINEAR_GATE_PCP_SHARD=1 to avoid replicated "
+            "linear_gate weights exhausting KV-cache memory."
+        )
+
+
 def _require_mrv2_pcp_contract(vllm_config: object) -> None:
     """Reject every Model Runner V2 PCP configuration outside HCU support."""
 
@@ -119,13 +271,16 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         _require_hcu_pcp_attribute(model_config, "use_mla", "ModelConfig")
     )
     is_glm52 = architectures == ["GlmMoeDsaForCausalLM"]
-    if use_mla and not is_glm52:
+    is_hy4 = architectures == ["HYV4ForCausalLM"]
+    if use_mla and not (is_glm52 or is_hy4):
         raise ValueError(
-            "GLM-5.2 PCP only supports architecture "
-            "GlmMoeDsaForCausalLM."
+            "GLM-5.2 and HY V4 MLA PCP only support "
+            "GlmMoeDsaForCausalLM or HYV4ForCausalLM."
         )
     if is_glm52 and not use_mla:
         raise ValueError("GLM-5.2 PCP requires MLA or sparse MLA.")
+    if is_hy4 and not use_mla:
+        raise ValueError("HY V4 PCP requires sparse MLA.")
     if not use_mla:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -145,9 +300,14 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
         raise ValueError(
             "FlashAttention PCP does not support hybrid KV cache groups."
         )
+    hy4_topology = _hy4_pcp_topology(parallel_config) if is_hy4 else None
+    if is_hy4 and hy4_topology not in {(4, 2, 1), (1, 4, 2), (1, 8, 1)}:
+        raise ValueError(f"HY V4 PCP topology is not validated: {hy4_topology}")
+    if is_hy4 and hy4_topology == (1, 8, 1):
+        _require_hy4_pcp8_contract(vllm_config)
     if _require_hcu_pcp_attribute(
         parallel_config, "pipeline_parallel_size", "ParallelConfig"
-    ) != 1:
+    ) != 1 and hy4_topology != (1, 4, 2):
         raise ValueError("HCU PCP does not support pipeline parallelism.")
     dcp_size = int(
         _require_hcu_pcp_attribute(
@@ -194,6 +354,8 @@ def _require_mrv2_pcp_contract(vllm_config: object) -> None:
             raise ValueError(
                 "GLM-5.2 PCP+MTP requires one to three speculative tokens."
             )
+        if is_hy4 and hy4_topology == (1, 4, 2) and num_speculative_tokens != 2:
+            raise ValueError("HY V4 PP2 PCP+MTP requires exactly two draft tokens.")
     if _require_hcu_pcp_attribute(vllm_config, "lora_config", "VllmConfig") is not None:
         raise ValueError("HCU PCP does not support LoRA.")
     if _require_hcu_pcp_attribute(
@@ -264,18 +426,28 @@ def validate_and_update_hcu_config(vllm_config: object) -> HcuFeatureConfig:
     _normalize_hcu_model_runner(vllm_config.model_config)
 
     _validate_hcu_pcp_scope(vllm_config)
+    from vllm_hcu.models.hy_v4.dcp_config import validate_hy4_dcp_config
+
+    validate_hy4_dcp_config(vllm_config)
     _validate_dspark_pd_scope(vllm_config)
     feature_config = get_hcu_config(vllm_config)
-    updates: dict[str, str] = {}
+    feature_config = _normalize_dspark_draft_deepep_topology(
+        vllm_config, feature_config
+    )
+    from vllm_hcu.platforms import envs as hcu_envs
+
+    updates: dict[str, str | bool] = {
+        # The Qwen3 forward wrapper closes over this effective policy. Persist
+        # the exact same master-and-child result before VllmConfig.compute_hash
+        # so feature-off and feature-on AOT graphs cannot share a cache entry.
+        "fused_qwen3_rms_rope": hcu_envs.fused_qwen3_rms_rope_enabled(),
+    }
     if feature_config.hcu_flash_attn_mode is None:
         # Persist the resolved sub-mode before vLLM computes compilation cache
         # hashes. Classic, CUTLASS, and CUSTOM do not share a KV-cache ABI.
-        from vllm_hcu.platforms import envs as hcu_envs
-
         updates["hcu_flash_attn_mode"] = hcu_envs.resolve_hcu_flash_attn_mode(None)
-    if updates:
-        feature_config = feature_config.with_updates(**updates)
-    # Persist the resolved mode so it enters vLLM's compilation hash.
+    feature_config = feature_config.with_updates(**updates)
+    # Persist every resolved graph policy so it enters vLLM's compilation hash.
     set_hcu_config(vllm_config, feature_config)
 
     feature_config = bind_hcu_config(vllm_config)

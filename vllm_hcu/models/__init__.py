@@ -27,6 +27,15 @@ def register_model():
         "DeepseekV32MTPModel", "vllm_hcu.models.deepseek_mtp:DeepSeekMTP"
     )
 
+    # Native DeepSeek V4 MTP owns the execution contract. Route its
+    # architecture through a narrow loader adapter so compressed-tensors
+    # W8A8 ``weight_scale`` parameters also satisfy the native loader's
+    # ``weight_scale_inv`` lookup.
+    ModelRegistry.register_model(
+        "DeepSeekV4MTPModel",
+        "vllm_hcu.models.deepseek_v4_mtp_compat:DeepSeekV4MTP",
+    )
+
     ModelRegistry.register_model(
         "GlmMoeDsaForCausalLM", "vllm_hcu.models.deepseek_v2:GlmMoeDsaForCausalLM"
     )
@@ -45,6 +54,14 @@ def register_model():
     
     ModelRegistry.register_model(
         "HYV3MTPModel", "vllm_hcu.models.hy_v3_mtp:HYV3MTP"
+    )
+
+    ModelRegistry.register_model(
+        "HYV4ForCausalLM", "vllm_hcu.models.hy_v4:HYV4ForCausalLM"
+    )
+
+    ModelRegistry.register_model(
+        "HYV4MTPModel", "vllm_hcu.models.hy_v4:HYV4MTP"
     )
 
     ModelRegistry.register_model(

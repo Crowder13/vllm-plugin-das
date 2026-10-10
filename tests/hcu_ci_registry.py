@@ -50,6 +50,16 @@ register_hcu_ci(
 )
 register_hcu_ci(
     job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_qwen3_fused_rms_rope_accuracy.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
+    target="tests/accuracy/test_lightop_autoawq_accuracy.py",
+    est_time=60,
+)
+register_hcu_ci(
+    job="accuracy-gfx938",
     target="tests/accuracy/test_moe_align_fallback_graph.py",
     est_time=120,
 )
@@ -129,6 +139,32 @@ register_hcu_ci(
     job="integration-smoke-gfx938",
     target="tests/integration/server/test_evalscope_report_threshold.py",
     est_time=30,
+)
+register_hcu_ci(
+    job="integration-smoke-gfx938",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_v0281_gfx938_humaneval16.py::"
+        "test_v0281_gfx938_selected_profile_humaneval16"
+    ),
+    est_time=14400,
+    disabled=(
+        "the local gfx938 validation matrix requires an explicitly selected "
+        "profile and checkpoints outside the configured CI model roots"
+    ),
+)
+register_hcu_ci(
+    job="integration-smoke-gfx938",
+    target=(
+        "tests/integration/server/"
+        "test_evalscope_kimi_k26_gfx938_humaneval64.py::"
+        "test_kimi_k26_gfx938_humaneval64"
+    ),
+    est_time=14400,
+    disabled=(
+        "the Kimi-K2.6 checkpoint is unavailable in the configured CI model "
+        "roots"
+    ),
 )
 
 register_hcu_ci(

@@ -27,9 +27,8 @@ _WRAPPER = "_vllm_hcu_fla_chunk_delta_h_wrapper"
 def _enabled() -> bool:
     from vllm_hcu.platforms import envs as henvs
 
-    return bool(
-        henvs.VLLM_HCU_USE_CUSTOM_OPS
-        and henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
+    return henvs.optional_custom_op_enabled(
+        henvs.VLLM_HCU_USE_CUSTOM_AITER_FLA
     )
 
 
@@ -122,6 +121,8 @@ def apply_to_module(module: ModuleType) -> bool:
             chunk_indices=chunk_indices,
             use_exp2=use_exp2,
             transpose_state_layout=True,
+            # vLLM reserves block/state index 0 as NULL_BLOCK_ID.
+            null_state_index=0,
             kernel_cfg=None,
         )
 

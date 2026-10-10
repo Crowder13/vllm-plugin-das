@@ -27,7 +27,7 @@ import vllm_hcu.patch.config as hcu_config_module
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm_hcu.model_executor.layers.quantization import slimquant_facade
-from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config
+from vllm_hcu.patch.config import HcuFeatureConfig, get_hcu_config, set_hcu_config
 from vllm_hcu.patch.platform.core_fix import (
     patch_compilation_config,
     patch_engine_args,
@@ -505,6 +505,34 @@ def test_positional_additional_config_is_merged_not_overwritten() -> None:
     )
 
 
+def test_engine_args_preserves_platform_resolved_compile_factors() -> None:
+    module = _make_arg_utils_module()
+    original_create = module.EngineArgs.create_engine_config
+
+    def create_engine_config(
+        self,
+        usage_context: object | None = None,
+        headless: bool = False,
+    ) -> object:
+        config = original_create(self, usage_context, headless)
+        set_hcu_config(
+            config,
+            get_hcu_config(config).with_updates(
+                fused_qwen3_rms_rope=False,
+                hcu_flash_attn_mode="varlen",
+            ),
+        )
+        return config
+
+    module.EngineArgs.create_engine_config = create_engine_config
+    patch_engine_args.apply_to_module(module)
+
+    config = module.EngineArgs().create_engine_config()
+
+    assert get_hcu_config(config).fused_qwen3_rms_rope is False
+    assert get_hcu_config(config).hcu_flash_attn_mode == "varlen"
+
+
 def test_engine_args_rejects_incompatible_target_signature() -> None:
     module = ModuleType(patch_engine_args.TARGET_MODULE)
 
@@ -833,6 +861,9 @@ def _make_vllm_module() -> ModuleType:
     module = ModuleType(patch_vllm_config.TARGET_MODULE)
 
     class FakeVllmConfig:
+        def _maybe_enable_breakable_cudagraph(self) -> bool:
+            return False
+
         def __init__(self, sizes: list[int] | None = None) -> None:
             self.additional_config: dict[str, Any] = {}
             self.model_config = _FakeModelConfig(_FakeHFConfig("old"))
@@ -1015,6 +1046,7 @@ def _validation_config(feature_config: HcuFeatureConfig) -> object:
         additional_config={"hcu": feature_config.to_dict()},
         compilation_config=_ValidationCompilation(),
         model_config=SimpleNamespace(
+            architectures=["Qwen3ForCausalLM"],
             enforce_eager=True,
             use_mla=False,
             max_model_len=4096,
@@ -1147,6 +1179,85 @@ def test_deepep_auto_rejects_non_dp_ep_topology_before_model_loading(
         patch_vllm_config.validate_and_update_hcu_config(config)
 
 
+def test_deepseek_v4_dspark_draft_clone_reuses_target_deepep_topology() -> None:
+    target_parallel = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        use_ubatching=False,
+    )
+    draft_parallel = SimpleNamespace(
+        all2all_backend="allgather_reducescatter",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    target_additional = {
+        "hcu": HcuFeatureConfig(deepep_auto=True).to_dict(),
+        "unrelated": {"keep": True},
+    }
+    config = _validation_config(HcuFeatureConfig())
+    # vllm.config.replace() retains the target's additional_config object when
+    # it swaps in SpeculativeConfig.draft_parallel_config for DSpark.
+    config.additional_config = target_additional
+    config.parallel_config = draft_parallel
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    resolved = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert resolved.deepep_auto is True
+    assert get_hcu_config(config).deepep_auto is True
+    assert config.parallel_config is target_parallel
+    assert target_parallel._vllm_hcu_deepep_auto is True
+    assert not hasattr(draft_parallel, "_vllm_hcu_deepep_auto")
+    assert config.additional_config is target_additional
+    assert config.additional_config["unrelated"] == {"keep": True}
+    assert get_hcu_config(target_additional).deepep_auto is True
+
+
+def test_deepseek_v4_dspark_deepep_rejects_mismatched_draft_tp() -> None:
+    target_parallel = SimpleNamespace(
+        all2all_backend="deepep_low_latency",
+        tensor_parallel_size=4,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=2,
+        enable_expert_parallel=True,
+        enable_eplb=False,
+        use_ubatching=False,
+    )
+    draft_parallel = SimpleNamespace(
+        all2all_backend="allgather_reducescatter",
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        data_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    config = _validation_config(HcuFeatureConfig(deepep_auto=True))
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.parallel_config = draft_parallel
+    config.speculative_config = SimpleNamespace(
+        method="dspark",
+        target_parallel_config=target_parallel,
+        draft_parallel_config=draft_parallel,
+    )
+
+    with pytest.raises(ValueError, match="draft_tp=2, target_tp=4"):
+        patch_vllm_config.validate_and_update_hcu_config(config)
+
+
 def test_deepep_auto_rejects_ubatching_before_model_loading() -> None:
     config = _validation_config(HcuFeatureConfig(deepep_auto=True))
     config.parallel_config.all2all_backend = "deepep_low_latency"
@@ -1176,6 +1287,27 @@ def test_deepseek_v4_dspark_allows_mooncake_pd_before_model_loading() -> None:
     patch_vllm_config.validate_and_update_hcu_config(
         _dspark_pd_config("MooncakeConnector")
     )
+
+
+def test_deepseek_v4_enables_breakable_cuda_graph_by_default() -> None:
+    variable = "VLLM_USE_BREAKABLE_CUDAGRAPH"
+    original = os.environ.get(variable)
+    with pytest.MonkeyPatch.context() as environment:
+        # Seed then delete so MonkeyPatch records how to restore an initially
+        # absent variable after the code under test writes it directly.
+        environment.setenv(variable, "test-restore-sentinel")
+        environment.delenv(variable)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"],
+                enforce_eager=False,
+            )
+        )
+
+        patch_vllm_config._normalize_hcu_breakable_cudagraph(config)
+
+        assert os.environ[variable] == "1"
+    assert os.environ.get(variable) == original
 
 
 @pytest.mark.parametrize("connector", ["NixlConnector", "ExampleConnector"])
@@ -1458,6 +1590,7 @@ def _vllm_hash(additional_config: dict[str, Any]) -> str:
         load_config=None,
         offload_config=None,
         attention_config=None,
+        engram_config=None,
         lora_config=None,
         speculative_config=None,
         structured_outputs_config=None,
@@ -1503,9 +1636,78 @@ def test_hcu_flash_attention_mode_is_finalized_before_config_hash(
     assert get_hcu_config(config) == feature_config
 
 
+@pytest.mark.parametrize(
+    ("master", "feature", "expected"),
+    [
+        ("0", "0", False),
+        ("0", "1", False),
+        ("1", "0", False),
+        ("1", "1", True),
+    ],
+)
+def test_fused_qwen3_rms_rope_policy_is_finalized_before_config_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    master: str,
+    feature: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+    monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", feature)
+
+    config = _validation_config(HcuFeatureConfig())
+    feature_config = patch_vllm_config.validate_and_update_hcu_config(config)
+
+    assert feature_config.fused_qwen3_rms_rope is expected
+    assert get_hcu_config(config) == feature_config
+
+
+def test_fused_qwen3_rms_rope_effective_policy_partitions_persistent_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A 0 -> 1 restart must not load the graph persisted for feature-off."""
+
+    def cache_key(master: str, feature: str) -> str:
+        monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", master)
+        monkeypatch.setenv("VLLM_HCU_USE_FUSED_RMS_ROPE", feature)
+        config = _validation_config(HcuFeatureConfig())
+        patch_vllm_config.validate_and_update_hcu_config(config)
+        return _vllm_hash(config.additional_config)
+
+    disabled_key = cache_key("1", "0")
+    disabled_graph = tmp_path / disabled_key / "graph.py"
+    disabled_graph.parent.mkdir()
+    disabled_graph.write_text("torch.ops.aten.rms_norm\n", encoding="utf-8")
+
+    enabled_key = cache_key("1", "1")
+    enabled_graph = tmp_path / enabled_key / "graph.py"
+    if not enabled_graph.exists():
+        enabled_graph.parent.mkdir()
+        enabled_graph.write_text(
+            "torch.ops.vllm.hcu_fused_rms_rotary_embedding\n",
+            encoding="utf-8",
+        )
+
+    # Both master-off combinations collapse onto the same effective policy,
+    # while the only graph-changing transition receives a distinct cache key.
+    assert cache_key("0", "0") == cache_key("0", "1")
+    assert cache_key("0", "1") == disabled_key
+    assert enabled_key != disabled_key
+    assert "hcu_fused_rms_rotary_embedding" in enabled_graph.read_text(
+        encoding="utf-8"
+    )
+
+
 def test_varlen_flash_attention_uses_64_token_cache_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Source-only test worktrees do not contain the compiled extension. This
+    # contract only exercises backend block-size metadata, not HCU kernels.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_hcu.hcu_ops",
+        ModuleType("vllm_hcu.hcu_ops"),
+    )
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm_hcu.v1.attention.backends.flash_attn import (
         HcuFlashAttentionBackend,
@@ -1551,6 +1753,36 @@ def test_varlen_flash_attention_uses_64_token_cache_blocks(
     assert config.cache_config.block_size == 64
 
 
+def test_sparse_cache_normalization_tolerates_missing_attention_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_hcu.patch.import_coordinator import IMPORT_COORDINATOR
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.compilation_config.cudagraph_mode = SimpleNamespace(
+        has_full_cudagraphs=lambda: False
+    )
+    config.parallel_config.worker_cls = "custom"
+    config.parallel_config.distributed_executor_backend = "uni"
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        cache_dtype="fp8_e4m3",
+    )
+    config.attention_config = None
+    monkeypatch.setattr(IMPORT_COORDINATOR, "drain_ready_callbacks", lambda: None)
+    monkeypatch.setattr(
+        patch_vllm_config,
+        "validate_and_update_hcu_config",
+        lambda vllm_config: HcuFeatureConfig(),
+    )
+
+    HCUPlatform.check_and_update_config(config)
+
+    assert config.cache_config.cache_dtype == "fp8_e4m3"
+
+
 def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1571,6 +1803,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     config.cache_config = SimpleNamespace(
         user_specified_block_size=False,
         block_size=16,
+        cache_dtype="fp8_e4m3",
         kv_cache_dtype_skip_layers=[],
     )
     config.attention_config = SimpleNamespace(
@@ -1587,6 +1820,7 @@ def test_sparse_flashmla_sets_engine_cache_block_size_before_worker_start(
     HCUPlatform.check_and_update_config(config)
 
     assert config.cache_config.block_size == 64
+    assert config.cache_config.cache_dtype == "fp8_ds_mla"
 
     config.cache_config.block_size = 16
 
@@ -1654,6 +1888,43 @@ def test_sparse_flashmla_preserves_upstream_hybrid_block_alignment(
     HCUPlatform.update_block_size_for_backend(config)
 
     assert config.cache_config.block_size == 1152
+
+
+def test_deepseek_v4_aligns_explicit_block_with_sparse_backend_and_compressor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    config = _validation_config(HcuFeatureConfig())
+    config.cache_config = SimpleNamespace(
+        user_specified_block_size=True,
+        block_size=64,
+        kv_cache_dtype_skip_layers=[],
+    )
+    config.attention_config = SimpleNamespace(
+        backend=AttentionBackendEnum.FLASHMLA_SPARSE
+    )
+    config.model_config.architectures = ["DeepseekV4ForCausalLM"]
+    config.model_config.hf_config = SimpleNamespace(
+        compress_ratios=[0, 4, 128, 4, 128]
+    )
+    config.model_config.is_hybrid = False
+
+    class FlashMLABackend:
+        @staticmethod
+        def get_name():
+            return "FLASHMLA_SPARSE"
+
+    monkeypatch.setattr(
+        HCUPlatform,
+        "_find_non_ssm_backend",
+        classmethod(lambda cls, vllm_config: FlashMLABackend),
+    )
+
+    HCUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 256
 
 
 @pytest.mark.parametrize(
@@ -1727,6 +1998,210 @@ def test_explicit_attention_backend_restores_hcu_registration(
             register_backend(backend, previous_path)
 
     assert selected_path == expected_path
+
+
+@pytest.mark.parametrize("backend_name", ["FLASH_ATTN", "TRITON_ATTN"])
+def test_custom_ops_master_off_preserves_explicit_dense_attention_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=256,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+    )
+    selected_backend = AttentionBackendEnum[backend_name]
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == selected_backend.get_path()
+
+
+@pytest.mark.parametrize(
+    ("custom_ops", "selected_backend_name", "expected_backend_name"),
+    [
+        ("1", None, "FLASHMLA"),
+        ("1", "FLASHMLA", "FLASHMLA"),
+        ("1", "TRITON_MLA", "TRITON_MLA"),
+        ("0", None, "TRITON_MLA"),
+        ("0", "FLASHMLA", "TRITON_MLA"),
+        ("0", "TRITON_MLA", "TRITON_MLA"),
+    ],
+)
+def test_dense_mla_selection_obeys_custom_ops_master(
+    monkeypatch: pytest.MonkeyPatch,
+    custom_ops: str,
+    selected_backend_name: str | None,
+    expected_backend_name: str,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", custom_ops)
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+    )
+    selected_backend = (
+        None
+        if selected_backend_name is None
+        else AttentionBackendEnum[selected_backend_name]
+    )
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == AttentionBackendEnum[expected_backend_name].get_path()
+
+
+@pytest.mark.parametrize("selected_backend_name", [None, "FLASHMLA_SPARSE"])
+def test_sparse_mla_keeps_boltops_fallback_under_custom_ops_master_off(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_backend_name: str | None,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+        use_sparse=True,
+    )
+    selected_backend = (
+        None
+        if selected_backend_name is None
+        else AttentionBackendEnum[selected_backend_name]
+    )
+
+    selected_path = HCUPlatform.get_attn_backend_cls(
+        selected_backend,
+        selector_config,
+    )
+
+    assert selected_path == AttentionBackendEnum.FLASHMLA_SPARSE.get_path()
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_dense_mla_master_off_preserves_third_party_flashmla_override(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+    from vllm.v1.attention.backends.registry import (
+        AttentionBackendEnum,
+        register_backend,
+    )
+    from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm_hcu.platforms.hcu import HCUPlatform
+
+    class AvailableBackend:
+        @classmethod
+        def validate_configuration(cls, **_kwargs) -> list[str]:
+            return []
+
+    backend = AttentionBackendEnum.FLASHMLA
+    was_overridden = backend.is_overridden()
+    previous_path = backend.get_path()
+    third_party_path = "third_party.attention.CustomFlashMLABackend"
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "0")
+    monkeypatch.setattr(
+        AttentionBackendEnum,
+        "get_class",
+        lambda _self: AvailableBackend,
+    )
+    monkeypatch.setattr(
+        HCUPlatform,
+        "get_device_capability",
+        classmethod(lambda _cls: DeviceCapability(9, 3)),
+    )
+    selector_config = AttentionSelectorConfig(
+        head_size=192,
+        dtype=torch.bfloat16,
+        kv_cache_dtype="auto",
+        block_size=None,
+        use_mla=True,
+    )
+
+    try:
+        register_backend(backend, third_party_path)
+        selected_path = HCUPlatform.get_attn_backend_cls(
+            backend if explicit else None,
+            selector_config,
+        )
+    finally:
+        backend.clear_override()
+        if was_overridden:
+            register_backend(backend, previous_path)
+
+    assert selected_path == third_party_path
 
 
 @pytest.mark.parametrize("explicit", [True, False])
