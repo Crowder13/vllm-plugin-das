@@ -1,32 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
-# DTK 包由 CI 通过 build-arg 传入, 从 dev 基础镜像内联安装 (分层方式同 ciimage 的框架镜像):
-#   第一段下载解压 DTK 并把 lib 移出 (约 20G 的层只存在于本地构建缓存, 不会推到 Harbor),
-#   第二段 lib 一层 + 其余一层 COPY 回 /opt/dtk, 避免单个超大层
-# 不再依赖预装 DTK 的基础镜像, 便于按次更换 DTK 包
+# 直接基于预装 DTK 的基础镜像构建 (DTK 已内置于 BASE_IMAGE, CI 内不再安装 DTK):
+#   基础镜像来自镜像总表 ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<版本>,
+#   由 CI 通过 build-arg 按固定格式拼接传入; 换 DTK 包 = 换基础镜像 tag
 ARG BASE_IMAGE
-ARG DTK_PKG_URL
 
-# 第一段: 下载并解压 DTK, 按 ciimage 的方式把 lib 移出单独存放
-FROM ${BASE_IMAGE} AS dtk_src
-ARG DTK_PKG_URL
-RUN wget -q -O - "${DTK_PKG_URL}" | tar -xzf - -C /opt && \
-    mv /opt/dtk-* /opt/dtk && \
-    mv /opt/dtk/lib /dtk_lib
-
-# 第二段: 正式镜像, 先装入 DTK(lib 一层 + 其余一层), 再装框架
 FROM ${BASE_IMAGE}
-ARG DTK_VERSION
 
 ENV ROCM_PATH=/opt/dtk
-COPY --from=dtk_src /dtk_lib ${ROCM_PATH}/lib
-COPY --from=dtk_src /opt/dtk ${ROCM_PATH}
 
 RUN echo "source /opt/dtk/env.sh" >> ~/.bashrc && \
     echo 'export LD_LIBRARY_PATH=/usr/local/lib/python3.10/dist-packages/amdsmi:$LD_LIBRARY_PATH' >> ~/.bashrc
-
-ENV DTK_VERSION=${DTK_VERSION}
 
 SHELL ["/bin/bash", "-c"]
 
@@ -68,16 +53,8 @@ RUN wget -q "${RESOURCE_SERVER_URL}/ai_cc/Nightly/hcu_llvm_installer.sh" -O /tmp
     bash /tmp/hcu_llvm_installer.sh --major 1.0.0 && \
     rm -f /tmp/hcu_llvm_installer.sh
 
-# 从 nightly 归档拉取 26.04 最新 blas cut 包, 解压后覆盖到 DTK 安装目录(默认 /opt/dtk)
-RUN wget -q "${RESOURCE_SERVER_URL}/Jenkins/CI_scripts/dtk_blas_cut_installer.sh" -O /tmp/dtk_blas_cut_installer.sh && \
-    chmod +x /tmp/dtk_blas_cut_installer.sh && \
-    bash /tmp/dtk_blas_cut_installer.sh --version 26.04 --os ubuntu20.04 && \
-    rm -f /tmp/dtk_blas_cut_installer.sh
-
-# ---layer--- shca 驱动
-RUN wget -q "${RESOURCE_SERVER_URL}/pkg/shca/others/20260706/shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb" \
-    && dpkg -i --force-all shca-tools-ofed_3.500.4.B020-Ubuntu22.04_amd64.deb \
-    && rm -rf shca-tools*.deb
+#blas cut / shca / UCX 等均已在基础镜像内就绪 (基础镜像含 blas cut 覆盖与 /opt/ucx),
+# 此处不再重复安装 DTK 相关组件
 
 # ---layer--- vLLM 框架依赖
 ARG VLLM_VERSION
@@ -115,14 +92,7 @@ RUN TORCH_TAG="torch${TORCH_VERSION//./}" \
     && pip cache purge
     
 
-# ---layer--- UCX (scale-out / mooncake 多机传输依赖)
-RUN wget -q ${RESOURCE_SERVER_URL}/pkg/openmpi/ucx-1.21.0.tar.gz \
-    && tar -xzf ucx-1.21.0.tar.gz \
-    && cd ucx-1.21.0 \
-    && ./configure --prefix=/opt/ucx --enable-mt --enable-optimizations --enable-tuning --enable-cma --with-rocm=/opt/dtk --without-cuda \
-    && make && make install \
-    && cd .. \
-    && rm -rf ucx-1.21.0 ucx-1.21.0.tar.gz
+# UCX 已在基础镜像内 (/opt/ucx, 路径已在其 ENV 中), 不再重复编译
 
 # 构建完成后移除内网 pip 源, 避免运行时意外拉取内网依赖
 RUN rm -rf ~/.pip/pip.conf
