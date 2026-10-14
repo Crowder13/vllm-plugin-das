@@ -36,23 +36,9 @@ env:
 jobs:
   build:
     # 需要能访问内网 pip 源 / AICC 下载地址 / Harbor 的自托管构建节点
-    # 加镜像目标 = 改下面矩阵; image/DTK 版本号/输出 tag 全部按矩阵字段拼接,
-    # 镜像总表格式: ${HARBOR_SITE}/hcu/base/dtk:<DTK版本>-<OS>-py<Python版本>
     runs-on:
       - ci
       - bw1100
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - dtk_tag: "26.04.1"
-            os_tag: "ubuntu22.04"
-            python_version: "3.10"
-            torch_version: "2.11.0"
-            # AICC 大版本, 安装脚本 --major 装该版本中日期最新的包 (26.04 段为 1.0.0)
-            aicc_major: "1.0.0"
-            # blas cut 版本, 安装脚本按版本+os 拉归档最新包覆盖到 /opt/dtk
-            blas_cut_version: "26.04"
     outputs:
       docker_image: ${{ steps.gen-tag.outputs.docker_image }}
     steps:

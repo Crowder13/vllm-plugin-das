@@ -24,7 +24,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-linux-gfx938-1
+      - bw1100
     timeout-minutes: 120
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -92,7 +92,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-linux-gfx938-1
+      - bw1100
     timeout-minutes: 60
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -150,7 +150,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-linux-gfx938-1
+      - bw1100
     timeout-minutes: 120
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-1
@@ -210,7 +210,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-linux-gfx938-4
+      - bw1100
     timeout-minutes: 180
     concurrency:
       group: hcu-runner-hcu-linux-gfx938-4
@@ -275,7 +275,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     env:
       BUILD_RESULT: ${{ needs.build-wheel.result }}
       KERNEL_RESULT: ${{ needs.wheel-kernel-smoke.result }}
