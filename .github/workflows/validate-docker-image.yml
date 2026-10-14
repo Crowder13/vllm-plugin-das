@@ -37,7 +37,7 @@ jobs:
     name: Validate published image
     runs-on:
       - ci
-      - bw18
+      - bw1000
     steps:
       - name: Repair self-hosted workspace before checkout
         run: |

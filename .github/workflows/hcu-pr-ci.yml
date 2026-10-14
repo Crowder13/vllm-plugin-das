@@ -26,7 +26,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -166,7 +166,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     defaults:
       run:
         shell: bash
@@ -277,7 +277,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     env:
       STATIC_RESULT: ${{ needs.static-and-select.result }}
       AUTH_RESULT: ${{ needs.authorize-hcu.result }}
