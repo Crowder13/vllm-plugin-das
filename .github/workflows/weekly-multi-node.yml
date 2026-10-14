@@ -4,7 +4,7 @@
 name: HCU multi-node
 
 # Enable a schedule after at least one real multi-node test and a coordinated
-# hcu-linux-gfx938-8x2 runner have been registered. Until then the readiness
+# bw1100 runner have been registered. Until then the readiness
 # job keeps the hardware job skipped instead of reserving a runner that cannot
 # execute any registered tests.
 on:
@@ -19,7 +19,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     container:
       image: ${{ vars.HCU_CI_IMAGE }}
     defaults:
@@ -52,7 +52,7 @@ jobs:
               echo "Add a real test under \`tests/distributed/multi_node/\`,"
               echo "register the \`weekly-multi-node\` job in both the HCU test"
               echo "map and registry, then configure an"
-              echo "\`hcu-linux-gfx938-8x2\` runner."
+              echo "\`bw1100\` runner."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -66,7 +66,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-linux-gfx938-8x2
+      - bw1100
     timeout-minutes: 360
     env:
       VLLM_HCU_USE_FLASH_ATTN_UNIFIED: "1"
