@@ -23,6 +23,7 @@ jobs:
   build-wheel:
     runs-on:
       - self-hosted
+      - ci
       - hcu-linux-gfx938-1
     timeout-minutes: 120
     concurrency:
@@ -90,6 +91,7 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
+      - ci
       - hcu-linux-gfx938-1
     timeout-minutes: 60
     concurrency:
@@ -147,6 +149,7 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
+      - ci
       - hcu-linux-gfx938-1
     timeout-minutes: 120
     concurrency:
@@ -206,6 +209,7 @@ jobs:
     needs: build-wheel
     runs-on:
       - self-hosted
+      - ci
       - hcu-linux-gfx938-4
     timeout-minutes: 180
     concurrency:
@@ -270,6 +274,7 @@ jobs:
       - wheel-multi-card-smoke
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     env:
       BUILD_RESULT: ${{ needs.build-wheel.result }}
