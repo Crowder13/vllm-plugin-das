@@ -25,6 +25,7 @@ jobs:
     name: Static gate and test selection
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     defaults:
       run:
@@ -164,6 +165,7 @@ jobs:
     needs: static-and-select
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     defaults:
       run:
@@ -274,6 +276,7 @@ jobs:
       - selected-hcu-tests
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     env:
       STATIC_RESULT: ${{ needs.static-and-select.result }}

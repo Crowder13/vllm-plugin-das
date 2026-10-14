@@ -18,6 +18,7 @@ jobs:
     name: Check multi-node registration
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     container:
       image: ${{ vars.HCU_CI_IMAGE }}
@@ -64,6 +65,7 @@ jobs:
     if: needs.readiness.outputs.ready == 'true'
     runs-on:
       - self-hosted
+      - ci
       - hcu-linux-gfx938-8x2
     timeout-minutes: 360
     env:
