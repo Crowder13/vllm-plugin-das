@@ -27,9 +27,21 @@ env:
 
 jobs:
   compile:
+<<<<<<< HEAD
     name: compile (py${{ matrix.python_version }})
     # 需要 docker 与内网 pip 源访问能力的自托管 runner
     runs-on: self-hosted
+=======
+    name: compile (dtk${{ matrix.dtk_tag }}-py${{ matrix.python_version }}-torch${{ matrix.torch_version }})
+    # 直接使用预装 DTK 的基础镜像, CI 内不再安装 DTK; 换/加编译目标 = 改下面矩阵
+    # image 按镜像总表固定格式拼接:
+    #   ${{ vars.HARBOR_SITE }}/hcu/base/dtk:<dtk_tag>-rockylinux8.6-py<python_version>
+    # (container.image 不允许 env 上下文, 变量直接用 vars.HARBOR_SITE 内联)
+    # pip 源按 dtk_tag 走对应 nightly 归档: ${PYPI_URL}/nightly/dtk<dtk_tag去点>/+simple/
+    runs-on:
+      - ci
+      - self-hosted
+>>>>>>> c5ec372 (ci: runs-on 追加组织级 ci 标签, 仓库级 runner 下线前对齐组织级 runner 池)
     strategy:
       fail-fast: false
       matrix:

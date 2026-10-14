@@ -16,6 +16,7 @@ jobs:
   static-patch-gate:
     runs-on:
       - self-hosted
+      - ci
       - hcu-ci-pr
     container:
       image: ${{ vars.HCU_CI_IMAGE }}
