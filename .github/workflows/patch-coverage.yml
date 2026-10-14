@@ -17,7 +17,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     container:
       image: ${{ vars.HCU_CI_IMAGE_V0281 }}
     defaults:

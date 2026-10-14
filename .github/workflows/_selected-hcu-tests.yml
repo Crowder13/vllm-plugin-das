@@ -31,7 +31,7 @@ jobs:
     runs-on:
       - self-hosted
       - ci
-      - hcu-ci-pr
+      - bw1100
     env:
       SOURCE_IMAGE: ${{ inputs.image }}
     outputs:
